@@ -463,6 +463,25 @@ async def upload_file(
     return db_file
 
 
+def _file_to_dict(f: ProjectFile) -> dict:
+    """把项目文件记录转成前端可读 dict（含财务单据金额/日期字段）。"""
+    return {
+        "id": f.id,
+        "project_id": f.project_id,
+        "original_name": f.original_name,
+        "stored_name": f.stored_name,
+        "size": f.size or 0,
+        "category": f.category or "",
+        "doc_type": f.doc_type or "",
+        "stage": f.stage or "",
+        "ai_summary": f.ai_summary or "",
+        "amount": f.amount or 0,
+        "doc_date": f.doc_date or "",
+        "processing_status": f.processing_status or "done",
+        "uploaded_at": f.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") if f.uploaded_at else "",
+    }
+
+
 @app.get("/projects/{project_id}/files", summary="获取项目文件列表（可按分类/阶段筛选）")
 def list_files(
     project_id: int,
@@ -479,7 +498,7 @@ def list_files(
         q = q.filter(ProjectFile.category == category)
     if stage:
         q = q.filter(ProjectFile.stage == stage)
-    return q.all()
+    return [_file_to_dict(f) for f in q.all()]
 
 
 @app.get("/files/{file_id}/download", summary="下载文件")
@@ -949,6 +968,45 @@ def _extract_document_summary(content: str) -> dict:
     return data
 
 
+# ============ 合同格式白名单 + 财务单据标签（确定性识别，不依赖 LLM）============
+# 合同只可能是 Word 或 PDF，其余格式（图片/Excel/文本等）一律不是合同。
+CONTRACT_EXTS = {".doc", ".docx", ".pdf"}
+
+
+def _file_ext(filename: str) -> str:
+    return os.path.splitext(filename or "")[1].lower()
+
+
+def _is_contract_ext(filename: str) -> bool:
+    """判断文件扩展名是否可能为合同（仅 .doc/.docx/.pdf）。"""
+    return _file_ext(filename) in CONTRACT_EXTS
+
+
+# 财务单据标签（有金额的单据）：上传后自动归集到「财务单据」大类
+FINANCIAL_DOC_TAGS = ["发票", "结算单", "暂估单", "估算单", "付款凭证", "报销单", "收据"]
+
+_FIN_TAG_KEYWORDS = {
+    "发票": ["发票", "增值税", "invoice", "fapiao"],
+    "结算单": ["结算单", "结算表", "工程结算", "竣工结算", "结算书", "settlement"],
+    "暂估单": ["暂估单", "暂估", "预估单", "暂估金额"],
+    "估算单": ["估算单", "估算表", "概算", "估算书"],
+    "付款凭证": ["付款凭证", "付款申请", "支付凭证", "付款单"],
+    "报销单": ["报销单", "费用报销"],
+    "收据": ["收据", "receipt"],
+}
+
+
+def _detect_financial_tag(filename: str, content: str = "") -> str:
+    """根据文件名 + 正文关键词确定性识别财务单据类型，返回标签名或空串。"""
+    name = (filename or "").lower()
+    text = (content or "").lower()
+    for tag, kws in _FIN_TAG_KEYWORDS.items():
+        for kw in kws:
+            if kw in name or kw in text:
+                return tag
+    return ""
+
+
 # ============ 智能分类：一次 LLM 调用完成大类判断 + 资料分类 + 摘要 + 合同字段 ============
 def _classify_file(content: str, filename: str = "") -> dict:
     """一次调用 DeepSeek，完成：文件大类（合同/资料/成果/附件）+ 资料分类或成果子类型 + 阶段 + 摘要 +（合同字段）。
@@ -962,19 +1020,24 @@ def _classify_file(content: str, filename: str = "") -> dict:
     text_part = content[:6000] + "\n……（中间省略）……\n" + content[-2000:]
     prompt = (
         "请阅读下面这份文件的内容，先判断它属于哪一类，再按类别提取信息。\n\n"
-        "【文件大类】四选一：\n"
-        "- \"合同\"：合同、协议、采购单、订单、中标通知、报价单等\n"
+        "【文件大类】五选一：\n"
+        "- \"合同\"：合同、协议（注意：只有 .doc/.docx/.pdf 格式的文件才可能是合同）\n"
+        "- \"财务单据\"：发票、结算单、暂估单、估算单、付款凭证、报销单、收据等有金额的单据\n"
         "- \"资料\"：科技项目的方案、报告、申请书、任务书、纪要、验收材料、表格等\n"
         "- \"成果\"：专利证书（发明/实用新型/外观）、软件著作权、论文、获奖证书、科技奖励、标准、成果登记证书、鉴定报告等\n"
-        "- \"附件\"：无法归入上述三类的其他文件（图纸、照片、说明等）\n\n"
+        "- \"附件\"：无法归入上述四类的其他文件（图纸、照片、说明等）\n\n"
         "只返回一个 JSON 对象，格式：\n"
         "{\n"
-        "  \"category\": \"合同/资料/成果/附件\",\n"
+        "  \"category\": \"合同/财务单据/资料/成果/附件\",\n"
         "  \"summary\": \"50-100字概括这份文件\",\n"
         "  \"doc_type\": \"\",\n"
         "  \"stage\": \"\",\n"
+        "  \"amount\": 0,\n"
+        "  \"doc_date\": \"\",\n"
         "  \"contract\": null\n"
         "}\n\n"
+        "【category=财务单据 时】doc_type 从下面选最贴切的一个：发票、结算单、暂估单、估算单、付款凭证、报销单、收据；"
+        "amount 填价税合计金额（纯数字），doc_date 填单据发生日期（YYYY-MM-DD，没有填空串）\n\n"
         "【category=资料 时】doc_type 从下面 16 类里选最贴切的一个，stage 严格按下面对应：\n"
         "年度科技项目申请汇总表、科技项目申请书、技术方案、技术方案审查意见、可研报告、可研审查意见、"
         "责任承诺书、任务书、验收申请表、执行情况总结报告、经费决算表、经济分析报告、成员培养成长情况总结、"
@@ -990,9 +1053,10 @@ def _classify_file(content: str, filename: str = "") -> dict:
         "\"amount_value\":0,\"currency\":\"币种\",\"service_content\":\"服务内容一句话\","
         "\"sign_date\":\"签署日期\",\"term\":\"期限\",\"contract_type\":\"合同类型\",\"service_period\":\"服务周期\"}\n\n"
         "严格规则：\n"
-        "1. amount_value 必须是纯数字（去掉元/万元/货币符号/逗号/中文大写），\"壹佰万元整\"→1000000，\"100万\"→1000000\n"
+        "1. amount_value 与 amount 必须是纯数字（去掉元/万元/货币符号/逗号/中文大写），\"壹佰万元整\"→1000000，\"100万\"→1000000\n"
         "2. 没有的字段填空串\"\"，金额没有填 0\n"
-        "3. 只输出 JSON，禁止 markdown 代码块和任何解释\n\n"
+        "3. 只有 .doc/.docx/.pdf 格式的文件才可归为「合同」；发票/结算单/暂估单/估算单等有金额单据一律归「财务单据」，不能归「合同」或「资料」\n"
+        "4. 只输出 JSON，禁止 markdown 代码块和任何解释\n\n"
         f"文件名：{filename}\n"
         f"文件内容：\n{text_part}"
     )
@@ -1019,6 +1083,8 @@ def _classify_file(content: str, filename: str = "") -> dict:
     cat = str(data.get("category", "")).strip()
     if "合同" in cat:
         category = "合同"
+    elif "财务" in cat or "单据" in cat or "发票" in cat or "结算" in cat or "暂估" in cat or "估算" in cat:
+        category = "财务单据"
     elif "成果" in cat:
         category = "成果"
     elif "资料" in cat:
@@ -1026,12 +1092,20 @@ def _classify_file(content: str, filename: str = "") -> dict:
     else:
         category = "附件"
 
+    # 合同格式硬约束：只有 Word/PDF 才可能是合同；其余格式即使 LLM 判为合同也强制纠正为财务单据/附件
+    if category == "合同" and not _is_contract_ext(filename):
+        tag = _detect_financial_tag(filename, content)
+        category = "财务单据" if tag else "附件"
+
+    summary = (data.get("summary") or "").strip()
     result = {
         "category": category,
-        "summary": (data.get("summary") or "").strip(),
+        "summary": summary,
         "doc_type": "",
         "stage": "",
         "contract": None,
+        "amount": 0.0,
+        "doc_date": "",
     }
     if category == "资料":
         result["doc_type"] = (data.get("doc_type") or "").strip()
@@ -1045,15 +1119,27 @@ def _classify_file(content: str, filename: str = "") -> dict:
         except Exception:
             c["amount_value"] = 0.0
         result["contract"] = c
+    elif category == "财务单据":
+        result["doc_type"] = _detect_financial_tag(filename, content) or (data.get("doc_type") or "").strip() or "其他财务单据"
+        amt = data.get("amount")
+        if not amt:
+            amt = (data.get("contract") or {}).get("amount_value")
+        try:
+            result["amount"] = float(amt or 0)
+        except Exception:
+            result["amount"] = 0.0
+        result["doc_date"] = str(data.get("doc_date") or "").strip()
     return result
 
 
 def _apply_classification(db, f, cls: dict, project_id: int):
-    """把一次分类结果写回文件记录，并按类别写入对应摘要表（资料/合同/成果）。"""
+    """把一次分类结果写回文件记录，并按类别写入对应摘要表（资料/合同/成果/财务单据）。"""
     f.category = cls["category"]
     f.ai_summary = cls["summary"]
     f.doc_type = ""
     f.stage = ""
+    f.amount = None
+    f.doc_date = None
     if cls["category"] == "资料":
         f.doc_type = cls["doc_type"]
         f.stage = cls["stage"]
@@ -1064,6 +1150,16 @@ def _apply_classification(db, f, cls: dict, project_id: int):
         ))
     elif cls["category"] == "成果":
         f.doc_type = cls.get("doc_type") or ""   # 专利/论文/软著/获奖/标准…
+    elif cls["category"] == "财务单据":
+        f.doc_type = cls.get("doc_type") or "其他财务单据"
+        f.amount = cls.get("amount") or None
+        f.doc_date = cls.get("doc_date") or None
+        # 财务单据也写一条资料摘要，便于跨项目检索/统计引用
+        db.add(DocumentSummary(
+            file_id=f.id, project_id=project_id,
+            doc_type=f.doc_type, summary=cls["summary"], stage="",
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
     elif cls["category"] == "合同" and cls.get("contract"):
         c = cls["contract"]
         db.add(ContractSummary(
@@ -1132,7 +1228,7 @@ def _backfill_all(project_id: int, db) -> dict:
     db.commit()
 
     files = db.query(ProjectFile).filter(ProjectFile.project_id == project_id).all()
-    n_contracts = n_docs = n_attach = n_achievements = 0
+    n_contracts = n_docs = n_attach = n_achievements = n_finance = 0
     for f in files:
         if not is_supported_file(f.original_name):
             f.category = "附件"
@@ -1163,10 +1259,13 @@ def _backfill_all(project_id: int, db) -> dict:
             n_docs += 1
         elif cls["category"] == "成果":
             n_achievements += 1
+        elif cls["category"] == "财务单据":
+            n_finance += 1
         else:
             n_attach += 1
     db.commit()
-    return {"contracts": n_contracts, "documents": n_docs, "achievements": n_achievements, "attachments": n_attach}
+    return {"contracts": n_contracts, "documents": n_docs, "achievements": n_achievements,
+            "attachments": n_attach, "financial_docs": n_finance}
 
 
 @app.post("/projects/{project_id}/reindex", summary="补提取历史文件的分类和摘要")
@@ -1176,7 +1275,96 @@ def project_reindex(project_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="项目不存在")
     stats = _backfill_all(project_id, db)
     return {
-        "message": f"补分类完成：合同 {stats['contracts']} 份，项目资料 {stats['documents']} 份，成果 {stats['achievements']} 份，附件 {stats['attachments']} 份"
+        "message": f"补分类完成：合同 {stats['contracts']} 份，项目资料 {stats['documents']} 份，成果 {stats['achievements']} 份，财务单据 {stats['financial_docs']} 份，附件 {stats['attachments']} 份"
+    }
+
+
+@app.post("/admin/correct-classifications", summary="一次性修正现存文件分类（合同格式白名单 + 财务单据标签，确定性、不调 LLM）")
+def correct_classifications(db: Session = Depends(get_db)):
+    """对现存文件做确定性分类修正：
+    1) 非 Word/PDF 却标为「合同」的文件 → 按文件名关键词改标「财务单据」或「附件」，并清掉其错误合同摘要；
+    2) 文件名含发票/结算单/暂估单/估算单等关键词、当前为「附件/其他/未分类」的文件 → 改标「财务单据」。
+    返回修正数量；合同台账里的非 Word/PDF 记录仅报告、不自动删除。"""
+    fixed_contracts = 0
+    tagged_finance = 0
+    bad_contract_ledger = []
+    removed_contracts = []
+
+    files = db.query(ProjectFile).all()
+    for f in files:
+        # 1) 合同格式硬约束：非 Word/PDF 不能是合同
+        if f.category == "合同" and not _is_contract_ext(f.original_name):
+            tag = _detect_financial_tag(f.original_name)
+            if tag:
+                f.category = "财务单据"
+                f.doc_type = tag
+            else:
+                f.category = "附件"
+                f.doc_type = ""
+            f.stage = ""
+            db.query(ContractSummary).filter(ContractSummary.file_id == f.id).delete()
+            fixed_contracts += 1
+        # 2) 财务单据关键词识别：当前未归类（附件/其他/空）且文件名带财务关键词 → 打标签
+        elif f.category in (None, "", "附件", "其他"):
+            tag = _detect_financial_tag(f.original_name)
+            if tag:
+                f.category = "财务单据"
+                f.doc_type = tag
+                tagged_finance += 1
+        # 已正确分类的资料/成果/合同/财务单据不改动
+
+    # 3) 合同台账里的非 Word/PDF 记录：无关联节点/财务资料/变更则删除，否则仅报告
+    for c in db.query(Contract).all():
+        if _is_contract_ext(c.original_name):
+            continue
+        has_links = (
+            db.query(ContractNode).filter(ContractNode.contract_id == c.id).count() > 0
+            or db.query(FinancialDoc).filter(FinancialDoc.contract_id == c.id).count() > 0
+            or db.query(ContractNodeChange).filter(ContractNodeChange.contract_id == c.id).count() > 0
+        )
+        if has_links:
+            bad_contract_ledger.append({"id": c.id, "original_name": c.original_name})
+        else:
+            removed_contracts.append({"id": c.id, "original_name": c.original_name})
+            db.delete(c)
+
+    db.commit()
+    return {
+        "fixed_non_contract_files": fixed_contracts,
+        "tagged_financial_files": tagged_finance,
+        "removed_contracts": removed_contracts,
+        "bad_contract_ledger": bad_contract_ledger,
+    }
+
+
+@app.get("/funding/financial-files", summary="经费管理引用：自动归集的财务单据文件（发票/结算单/暂估单/估算单等）")
+def list_financial_files(
+    project_id: Optional[int] = None,
+    doc_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """返回文件库中已自动归集为「财务单据」的文件（含金额/日期/类型标签），供经费管理模块自动引用。"""
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    q = db.query(ProjectFile).filter(ProjectFile.category == "财务单据")
+    if project_id is not None:
+        q = q.filter(ProjectFile.project_id == project_id)
+    if doc_type:
+        q = q.filter(ProjectFile.doc_type == doc_type)
+    items = q.order_by(ProjectFile.doc_date.desc(), ProjectFile.id.desc()).all()
+    result = []
+    for f in items:
+        d = _file_to_dict(f)
+        d["project_name"] = pmap.get(f.project_id, "")
+        d["download_url"] = f"/files/{f.id}/download"
+        result.append(d)
+    by_type = {}
+    for d in result:
+        t = d["doc_type"] or "其他财务单据"
+        by_type[t] = round(by_type.get(t, 0.0) + (d["amount"] or 0), 2)
+    return {
+        "items": result,
+        "total_amount": round(sum(d["amount"] or 0 for d in result), 2),
+        "by_type": by_type,
     }
 
 
@@ -1900,6 +2088,9 @@ def _import_contract_from_project_file(db, file_id: int):
     pf = db.query(ProjectFile).filter(ProjectFile.id == file_id).first()
     if pf is None:
         return ("skipped", None)
+    # 合同格式硬约束：非 Word/PDF 不导入合同台账
+    if not _is_contract_ext(pf.original_name):
+        return ("skipped", None)
     # 幂等：该文件已导入过
     existing = db.query(Contract).filter(Contract.source_file_id == file_id).first()
     if existing is not None:
@@ -1945,7 +2136,7 @@ def _import_contract_from_project_file(db, file_id: int):
 
 @app.get("/contracts/import-candidates", summary="从文件管理扫描可导入合同的候选文件")
 def contract_import_candidates(db: Session = Depends(get_db)):
-    """扫描项目文件库中 category=合同 的文件，标注是否已导入合同台账。"""
+    """扫描项目文件库中 category=合同 且为 Word/PDF 的文件，标注是否已导入合同台账。"""
     pmap = {p.id: p.name for p in db.query(Project).all()}
     imported_ids = {c.source_file_id for c in db.query(Contract).filter(Contract.source_file_id.isnot(None)).all()}
     files = (
@@ -1954,6 +2145,7 @@ def contract_import_candidates(db: Session = Depends(get_db)):
         .order_by(ProjectFile.project_id.asc(), ProjectFile.id.asc())
         .all()
     )
+    files = [f for f in files if _is_contract_ext(f.original_name)]
     candidates = []
     for f in files:
         candidates.append({
@@ -2012,6 +2204,10 @@ async def upload_contracts(
     errors = []
     for file in files:
         try:
+            # 合同格式硬约束：只接受 Word(.doc/.docx) 或 PDF，其他格式一律不是合同
+            if not _is_contract_ext(file.filename):
+                errors.append({"filename": file.filename, "error": "仅支持 Word(.doc/.docx) 或 PDF 格式的合同文件"})
+                continue
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
             ext = os.path.splitext(file.filename)[1]
             stored_name = f"contract_{timestamp}{ext}"

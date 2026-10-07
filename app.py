@@ -788,6 +788,29 @@ def api_delete_financial_doc(did):
         return None
 
 
+def api_financial_files(project_id=None, doc_type=None):
+    """经费管理引用：文件库中自动归集的财务单据（发票/结算单/暂估单/估算单等）。"""
+    try:
+        params = {}
+        if project_id:
+            params["project_id"] = project_id
+        if doc_type:
+            params["doc_type"] = doc_type
+        resp = requests.get(f"{API_BASE}/funding/financial-files", params=params, timeout=60)
+        return resp.json() if resp.status_code == 200 else None
+    except Exception as e:
+        st.error(f"获取财务单据失败：{e}")
+        return None
+
+
+def api_correct_classifications():
+    try:
+        return requests.post(f"{API_BASE}/admin/correct-classifications", timeout=120)
+    except Exception as e:
+        st.error(f"分类修正失败：{e}")
+        return None
+
+
 # ============ 系统配置 ============
 def api_get_config():
     try:
@@ -1801,6 +1824,33 @@ elif menu == "➕ 创建项目":
 elif menu == "📁 文件管理":
     st.header("文件管理")
 
+    # —— 一次性分类修正：按「合同仅 Word/PDF」白名单 + 财务单据关键词，纠正现存文件分类 ——
+    with st.expander("🔧 分类修正工具（合同格式白名单 / 财务单据标签）", expanded=False):
+        st.caption("一键纠正现存文件的分类：非 Word/PDF 却标为「合同」的文件会改为「财务单据」或「附件」；"
+                   "文件名含发票/结算单/暂估单/估算单等关键词的文件会自动打上「财务单据」标签。")
+        if st.button("🛠️ 执行分类修正", key="btn_correct_classifications", use_container_width=True):
+            with st.spinner("正在修正文件分类……"):
+                r = api_correct_classifications()
+            if r and r.status_code == 200:
+                d = r.json()
+                _msg = (
+                    f"修正完成：纠正非合同文件 {d.get('fixed_non_contract_files', 0)} 份，"
+                    f"新增财务单据标签 {d.get('tagged_financial_files', 0)} 份。"
+                )
+                removed = d.get("removed_contracts", [])
+                if removed:
+                    _msg += f"已从合同台账移除 {len(removed)} 份非 Word/PDF 记录。"
+                st.success(_msg)
+                bad = d.get("bad_contract_ledger", [])
+                if bad:
+                    st.warning(
+                        f"合同台账中仍有 {len(bad)} 份非 Word/PDF 记录（含关联数据，未自动删除，请到「合同管理」手动处理）："
+                        + "；".join(f"#{x['id']} {x['original_name']}" for x in bad)
+                    )
+                st.rerun()
+            elif r is not None:
+                st.error(f"修正失败：{r.text}")
+
     projects = api_list_projects()
     if not projects:
         st.warning("请先创建项目，再上传文件。")
@@ -1971,6 +2021,8 @@ elif menu == "📁 文件管理":
                         dtype = f.get("doc_type") or ""
                         pstatus = f.get("processing_status") or "done"
                         tags = [t for t in [cat, dtype] if t]
+                        if f.get("amount"):
+                            tags.append(f"¥{f['amount']:,.2f}")
                         if pstatus == "processing":
                             tags.append("⏳ 解析中")
                         elif pstatus == "error":
@@ -2492,6 +2544,32 @@ elif menu == "💰 经费管理":
                     st.error(f"🔴 {a['title']}：{a['detail']}")
 
     st.divider()
+
+    # —— 自动归集的财务单据（文件库中识别出的发票/结算单/暂估单/估算单等）——
+    st.subheader("📎 自动归集的财务单据")
+    st.caption("文件管理上传时自动识别归集的财务单据（发票 / 结算单 / 暂估单 / 估算单等），此处汇总引用，可一键下载")
+    fin_files = api_financial_files()
+    if fin_files:
+        fin_items = fin_files.get("items", [])
+        by_type = fin_files.get("by_type", {})
+        if fin_items:
+            m1, m2 = st.columns(2)
+            m1.metric("财务单据总数", len(fin_items))
+            m2.metric("金额合计", f"¥{fin_files.get('total_amount', 0):,.2f}")
+            if by_type:
+                st.caption("　".join(f"{k}：¥{v:,.2f}" for k, v in by_type.items()))
+            _fin_rows = [{
+                "项目": it.get("project_name") or "",
+                "类型": it.get("doc_type") or "其他财务单据",
+                "金额": it.get("amount") or 0,
+                "发生日期": it.get("doc_date") or "",
+                "文件": it.get("original_name") or "",
+            } for it in fin_items]
+            st.dataframe(pd.DataFrame(_fin_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("文件库中暂未识别到财务单据。上传发票 / 结算单 / 暂估单 / 估算单等文件后会自动归集到这里。")
+    else:
+        st.info("文件库中暂未识别到财务单据。")
 
     # —— 财务资料上传 / 校对 ——
     st.subheader("🧾 财务资料（暂估单 / 结算单 / 发票）")

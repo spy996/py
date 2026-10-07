@@ -37,6 +37,8 @@ class ProjectFile(Base):
     stage = Column(String(20), nullable=True)      # 项目阶段
     ai_summary = Column(Text, nullable=True)       # AI 一句话摘要
     processing_status = Column(String(20), nullable=True, default="done")  # done / processing / error
+    amount = Column(Float, nullable=True)          # 财务单据金额（发票/结算单/暂估单/估算单等有金额单据）
+    doc_date = Column(String, nullable=True)       # 财务单据发生日期
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="files")
@@ -322,6 +324,8 @@ if "project_files" in _inspector.get_table_names():
         ("stage", "VARCHAR(20)"),
         ("ai_summary", "TEXT"),
         ("processing_status", "VARCHAR(20)"),
+        ("amount", "FLOAT"),
+        ("doc_date", "VARCHAR"),
     ]:
         if _col not in _fcols:
             with engine.begin() as _conn:
