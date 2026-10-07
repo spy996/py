@@ -40,3 +40,34 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("rd_platform")
+
+
+def _append_env(key: str, value: str) -> None:
+    """向 .env 追加/更新一个键值。"""
+    env_path = os.path.join(BASE_DIR, ".env")
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith(key + "="):
+            lines[i] = f"{key}={value}\n"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _remove_env(key: str) -> None:
+    """从 .env 删除某个键（用于把明文密码换成哈希）。"""
+    env_path = os.path.join(BASE_DIR, ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    kept = [ln for ln in lines if not ln.strip().startswith(key + "=")]
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(kept)
