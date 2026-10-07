@@ -39,8 +39,20 @@ from rapidocr_onnxruntime import RapidOCR
 from openpyxl import load_workbook
 
 
-# 全局只初始化一次，避免每页重复加载模型（模型加载很慢）
-_ocr_engine = RapidOCR()
+# OCR 引擎懒加载：首次真正用到 OCR 时才初始化（模型加载很慢，避免拖慢后端启动）
+_ocr_engine = None
+_ocr_init_lock = threading.Lock()
+
+
+def _get_ocr_engine():
+    """按需初始化并返回全局 OCR 引擎（双重检查锁，线程安全）。"""
+    global _ocr_engine
+    if _ocr_engine is None:
+        with _ocr_init_lock:
+            if _ocr_engine is None:
+                _ocr_engine = RapidOCR()
+    return _ocr_engine
+
 
 # OCR 引擎非线程安全，用锁串行化并发调用；后台线程池专门跑扫描件 OCR，避免上传阻塞
 _ocr_lock = threading.Lock()
@@ -803,7 +815,7 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
             img_bytes = pix.tobytes("png")
             try:
                 with _ocr_lock:
-                    result, _ = _ocr_engine(img_bytes)
+                    result, _ = _get_ocr_engine()(img_bytes)
             except Exception as e:
                 logger.warning(f"[OCR] 第 {i + 1} 页 OCR 失败：{e}")
                 continue
@@ -986,7 +998,7 @@ def _extract_text_from_image(file_bytes: bytes) -> str:
 
     result, _ = None, None
     with _ocr_lock:
-        result, _ = _ocr_engine(img)
+        result, _ = _get_ocr_engine()(img)
     if not result:
         return "（未识别到文字）"
 
@@ -5475,48 +5487,64 @@ def reminders(db: Session = Depends(get_db)):
 # ============ 数据大屏 ============
 @app.get("/dashboard", summary="数据大屏：宏观指标聚合")
 def dashboard(db: Session = Depends(get_db)):
-    projects = db.query(Project).all()
-    files = db.query(ProjectFile).all()
-    contracts = db.query(Contract).all()
-    achievements = db.query(Achievement).all()
-    fundings = db.query(Funding).all()
-    pmap = {p.id: p.name for p in projects}
+    from sqlalchemy import func
 
-    file_by_category = {}
-    file_by_stage = {}
+    # 计数：数据库 COUNT 聚合，避免加载全表
+    project_count = db.query(func.count(Project.id)).scalar() or 0
+    file_count = db.query(func.count(ProjectFile.id)).scalar() or 0
+    contract_count = db.query(func.count(Contract.id)).scalar() or 0
+    achievement_count = db.query(func.count(Achievement.id)).scalar() or 0
+    funding_count = db.query(func.count(Funding.id)).scalar() or 0
+
+    # 文件分类 / 阶段分布：GROUP BY 聚合
+    file_by_category = {
+        (k or "其他"): v
+        for k, v in db.query(ProjectFile.category, func.count(ProjectFile.id))
+        .group_by(ProjectFile.category).all()
+    }
+    file_by_stage = {
+        (k or "未划分"): v
+        for k, v in db.query(ProjectFile.stage, func.count(ProjectFile.id))
+        .group_by(ProjectFile.stage).all()
+    }
+
+    # 各项目文件数：GROUP BY project_id，再映射项目名（仅读 id/name 两列）
+    pmap = dict(db.query(Project.id, Project.name).all())
     project_file_count = {}
-    for f in files:
-        c = f.category or "其他"
-        file_by_category[c] = file_by_category.get(c, 0) + 1
-        s = f.stage or "未划分"
-        file_by_stage[s] = file_by_stage.get(s, 0) + 1
-        pname = pmap.get(f.project_id, "未知")
-        project_file_count[pname] = project_file_count.get(pname, 0) + 1
+    for pid, cnt in db.query(ProjectFile.project_id, func.count(ProjectFile.id)) \
+            .group_by(ProjectFile.project_id).all():
+        project_file_count[pmap.get(pid, "未知")] = cnt
 
-    contract_total_amount = round(sum(c.amount_value or 0 for c in contracts), 2)
+    # 合同总额：SUM 聚合；状态依赖业务逻辑（_contract_status），只读 due_date 遍历
+    contract_total_amount = round(db.query(func.sum(Contract.amount_value)).scalar() or 0, 2)
     contract_by_status = {}
     overdue_count = 0
-    for c in contracts:
-        status, _days = _contract_status(c.due_date)
+    for (due_date,) in db.query(Contract.due_date).all():
+        status, _ = _contract_status(due_date)
         contract_by_status[status] = contract_by_status.get(status, 0) + 1
         if status == "已超期":
             overdue_count += 1
 
-    achievement_by_category = {}
-    for a in achievements:
-        c = a.category or "其他"
-        achievement_by_category[c] = achievement_by_category.get(c, 0) + 1
+    # 成果分类分布：GROUP BY 聚合
+    achievement_by_category = {
+        (k or "其他"): v
+        for k, v in db.query(Achievement.category, func.count(Achievement.id))
+        .group_by(Achievement.category).all()
+    }
 
-    budget = sum(f.amount or 0 for f in fundings if f.fund_type == "预算")
-    income = sum(f.amount or 0 for f in fundings if f.fund_type == "到账")
-    expense = sum(f.amount or 0 for f in fundings if f.fund_type == "支出")
+    # 经费：按类型 SUM 聚合
+    fund_by_type = dict(db.query(Funding.fund_type, func.sum(Funding.amount))
+                        .group_by(Funding.fund_type).all())
+    budget = round(fund_by_type.get("预算") or 0, 2)
+    income = round(fund_by_type.get("到账") or 0, 2)
+    expense = round(fund_by_type.get("支出") or 0, 2)
 
     return {
-        "project_count": len(projects),
-        "file_count": len(files),
-        "contract_count": len(contracts),
-        "achievement_count": len(achievements),
-        "funding_count": len(fundings),
+        "project_count": project_count,
+        "file_count": file_count,
+        "contract_count": contract_count,
+        "achievement_count": achievement_count,
+        "funding_count": funding_count,
         "contract_total_amount": contract_total_amount,
         "contract_by_status": contract_by_status,
         "overdue_count": overdue_count,
