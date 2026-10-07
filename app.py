@@ -2657,6 +2657,8 @@ elif menu == "💰 经费管理":
             for d in docs:
                 status = "✅ 已确认" if d.get("confirmed") else "🕓 待确认"
                 with st.expander(f"{status} {d['doc_type']} ｜ {d['original_name']} ｜ 金额 ¥{d.get('amount') or 0:,.2f}"):
+                    if d.get("remark"):
+                        st.caption(f"📝 {d['remark']}")
                     with st.form(f"fin_doc_form_{d['id']}"):
                         f1, f2, f3 = st.columns(3)
                         n_amt = f1.number_input("金额（价税合计）", value=float(d.get("amount") or 0), step=100.0, format="%.2f")

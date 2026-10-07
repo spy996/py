@@ -3089,9 +3089,71 @@ def delete_funding_attachment(att_id: int, db: Session = Depends(get_db)):
 # ============ 财务资料（暂估单 / 结算单 / 发票） ============
 FINANCIAL_DOC_TYPES = ["暂估单", "结算单", "发票"]
 
+# —— 财务单据金额/税额/日期的正则兜底提取（OCR 文本噪声大、LLM 漏识别时兜底）——
+# 注意：OCR 常把「¥/￥」识别成「Y」
+_MONEY_RE = re.compile(r"[¥￥Y]\s*([0-9][0-9,]*\.?\d{0,2})")
+_DATE_RE = re.compile(r"(\d{4})\s*[年/\-.]\s*(\d{1,2})\s*[月/\-.]\s*(\d{1,2})日?")
+
+
+def _to_float(v):
+    try:
+        return float(str(v).replace(",", "").replace(" ", ""))
+    except Exception:
+        return 0.0
+
+
+def _regex_find_amount(text):
+    """按「价税合计/合计金额」关键词定位价税合计金额；找不到再取全文最大 ¥/￥/Y 金额。"""
+    for kw in ("价税合计", "合计金额", "金额合计", "价税合计金额"):
+        idx = text.find(kw)
+        if idx == -1:
+            continue
+        seg = text[idx:idx + 120]
+        m = _MONEY_RE.search(seg)
+        if m:
+            v = _to_float(m.group(1))
+            if v > 0:
+                return v
+    vals = [_to_float(g) for g in _MONEY_RE.findall(text)]
+    return max(vals) if vals else 0.0
+
+
+def _regex_find_tax(text):
+    """「税额」关键词后紧邻的金额；找不到返回 0（税额识别主要靠 LLM）。"""
+    for kw in ("税额", "税 额"):
+        idx = text.find(kw)
+        if idx == -1:
+            continue
+        seg = text[idx:idx + 60]
+        m = _MONEY_RE.search(seg)
+        if m:
+            v = _to_float(m.group(1))
+            if v > 0:
+                return v
+    return 0.0
+
+
+def _regex_find_date(text):
+    """「开票日期/填开日期/日期」关键词后第一个日期；找不到再全文兜底。"""
+    for kw in ("开票日期", "填开日期", "销售日期", "开票时间", "日期", "时间"):
+        idx = text.find(kw)
+        if idx == -1:
+            continue
+        seg = text[idx:idx + 40]
+        m = _DATE_RE.search(seg)
+        if m:
+            y, mo, d = m.groups()
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    m = _DATE_RE.search(text)
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    return ""
+
 
 def _extract_financial_doc_fields(content: str, filename: str = "") -> dict:
-    """用 DeepSeek 从财务单据（暂估单/结算单/发票）抽取 价税合计金额、税额、发生日期。失败返回空 dict。"""
+    """用 DeepSeek 从财务单据（暂估单/结算单/发票）抽取 价税合计金额、税额、发生日期。
+    LLM 漏识别时用正则从原始文本兜底。失败返回空 dict。"""
     if not content or not content.strip():
         return {}
     headers = {
@@ -3107,14 +3169,15 @@ def _extract_financial_doc_fields(content: str, filename: str = "") -> dict:
         "  \"doc_date\": \"\"\n"
         "}\n\n"
         "字段说明：\n"
-        "- amount 价税合计金额（含税总额，纯数字）\n"
-        "- tax_amount 税额（纯数字，没有填 0）\n"
-        "- doc_date 单据/发票发生日期（YYYY-MM-DD）\n\n"
+        "- amount 价税合计金额（含税总额，纯数字）。发票上通常是「价税合计（小写）￥XXXX」或「（小写）¥XXXX」\n"
+        "- tax_amount 税额（纯数字，没有填 0），发票上在「税额」列或「合计」行\n"
+        "- doc_date 单据/发票发生日期（YYYY-MM-DD），发票上是「开票日期/填开日期」\n\n"
         "严格规则：\n"
         "1. 金额必须是纯数字，去掉元/货币符号/逗号/中文大写（\"壹佰万元整\"→1000000，\"100,000\"→100000，\"10万\"→100000）\n"
         "2. 价税合计优先；若只给出不含税金额与税率，请自行计算价税合计\n"
         "3. 日期统一 YYYY-MM-DD，没有就填空串\n"
-        "4. 只输出 JSON，禁止 markdown 代码块和任何解释\n\n"
+        "4. 本段文本来自 OCR 识别，可能有个别错字、把「¥」识别成「Y」、把「日」识别成「日」等，结合上下文判断即可，不要因个别乱码放弃提取\n"
+        "5. 只输出 JSON，禁止 markdown 代码块和任何解释\n\n"
         f"文件名：{filename}\n"
         f"单据文本：\n{text_part}"
     )
@@ -3132,23 +3195,26 @@ def _extract_financial_doc_fields(content: str, filename: str = "") -> dict:
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end <= start:
-        return {}
-
-    def _f(v):
+        data = {}
+    else:
         try:
-            return float(v)
+            data = json.loads(raw[start:end + 1])
         except Exception:
-            return 0.0
+            data = {}
 
-    try:
-        data = json.loads(raw[start:end + 1])
-    except Exception:
-        return {}
-    return {
-        "amount": _f(data.get("amount")),
-        "tax_amount": _f(data.get("tax_amount")),
-        "doc_date": str(data.get("doc_date") or "").strip(),
-    }
+    amount = _to_float(data.get("amount"))
+    tax_amount = _to_float(data.get("tax_amount"))
+    doc_date = str(data.get("doc_date") or "").strip()
+
+    # 正则兜底：LLM 漏识别/失败时，从原始 OCR 文本按关键词二次提取
+    if not amount:
+        amount = _regex_find_amount(content)
+    if not tax_amount:
+        tax_amount = _regex_find_tax(content)
+    if not doc_date:
+        doc_date = _regex_find_date(content)
+
+    return {"amount": amount, "tax_amount": tax_amount, "doc_date": doc_date}
 
 
 def _fin_doc_to_dict(d: FinancialDoc) -> dict:
@@ -3176,6 +3242,7 @@ def _process_financial_doc_async(doc_id: int, file_path: str, original_name: str
         content = ""
         try:
             content = extract_text_from_file(file_path)
+            logger.info(f"[财务单据后台] OCR/提取文本长度 {len(content)}：{original_name}")
         except Exception as e:
             logger.error(f"[财务单据后台] 提取文本失败 {original_name}：{e}")
 
@@ -3192,9 +3259,14 @@ def _process_financial_doc_async(doc_id: int, file_path: str, original_name: str
         d.amount = fields.get("amount") or None
         d.tax_amount = fields.get("tax_amount") or None
         d.doc_date = fields.get("doc_date") or None
-        d.remark = "LLM 自动提取，待人工确认"
+        if not content or not content.strip():
+            d.remark = "未能识别到文字（可能为模糊照片/扫描件），请人工填写金额/税额/日期"
+        elif not d.amount and not d.tax_amount and not d.doc_date:
+            d.remark = "已识别文字但未提取到金额/税额/日期，请人工校对"
+        else:
+            d.remark = "LLM 自动提取，待人工确认"
         db.commit()
-        logger.info(f"[财务单据后台] 解析完成 {original_name}")
+        logger.info(f"[财务单据后台] 解析完成 {original_name}（金额={d.amount} 税额={d.tax_amount} 日期={d.doc_date}）")
     except Exception as e:
         logger.error(f"[财务单据后台] 处理异常 {original_name}：{e}")
         try:

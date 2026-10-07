@@ -232,12 +232,30 @@ def is_supported_file(filename: str) -> bool:
 
 
 #直接把图片字节转成图像，支持 jpg/png/bmp 等格式
+def _preprocess_for_ocr(img):
+    """OCR 前预处理：限制尺寸 + 灰度化 + CLAHE 对比度增强，显著提升发票/单据照片的识别率。
+    超长边缩到 2400px（照片噪声多、OCR 慢），短边过小则放大（小字识别不清）。"""
+    h, w = img.shape[:2]
+    long_side = max(h, w)
+    if long_side > 2400:
+        scale = 2400.0 / long_side
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    elif long_side < 1200:
+        scale = 1200.0 / long_side
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
 def _extract_text_from_image(file_bytes: bytes) -> str:
-    """用 OCR 提取图片（截图/照片/扫描图）中的文字。"""
+    """用 OCR 提取图片（截图/照片/扫描图）中的文字（含预处理，对发票/单据照片更稳）。"""
     # 直接从内存中的图片字节解码成图像（BGR 格式，是 OCR 引擎需要的格式）
     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return "（无法解析图片文件，可能是格式损坏）"
+    img = _preprocess_for_ocr(img)
 
     result, _ = None, None
     with _ocr_lock:
