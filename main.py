@@ -1636,6 +1636,7 @@ def _extract_contract_fields(content: str, filename: str = "") -> dict:
         "字段说明：\n"
         "- amount_ex_tax 不含税金额、tax_rate 税率（小数，6% 填 0.06）、tax_amount 税额、amount_incl_tax 含税金额；没有填 0\n"
         "- warranty_ratio 质保金比例（小数，5% 填 0.05）、warranty_period 质保金到期时长（如\"12个月\"\"1年\"\"2年\"）；没有填 0 和空串\n"
+        "- contract_name 必须是能区分具体标的的名称（如\"俄公堡电站监控系统国产化改造\"）；若正文标题是\"物资设备采购合同\"\"采购合同\"\"合同\"等泛化标题，务必结合文件名与正文标的（项目/设备/服务名称）提炼具体名称\n"
         "- payment_nodes 付款节点数组，每项 {\"name\":\"节点名（预付款/进度款/验收款/质保金等）\",\"ratio\":比例小数,\"amount\":金额纯数字,\"date\":\"约定付款日期YYYY-MM-DD\"}\n"
         "- business_nodes 业务节点数组，每项 {\"name\":\"节点名（提交进度报告/验收/交付等）\",\"date\":\"约定日期YYYY-MM-DD\"}\n\n"
         "严格规则：\n"
@@ -2048,7 +2049,14 @@ def list_contracts(project_id: Optional[int] = None, db: Session = Depends(get_d
     if project_id is not None:
         q = q.filter(Contract.project_id == project_id)
     contracts = q.order_by(Contract.created_at.desc()).all()
-    return [_contract_to_dict(c) for c in contracts]
+    # 附带项目名，供前端下拉识别「该合同属于哪个项目」（LLM 抽取的合同名常过于泛化，需项目名兜底）
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    result = []
+    for c in contracts:
+        d = _contract_to_dict(c)
+        d["project_name"] = pmap.get(c.project_id, "")
+        result.append(d)
+    return result
 
 
 # ============ 合同：人工确认 + 字段编辑 + 执行计划节点 + 变更追溯 ============
@@ -3189,7 +3197,8 @@ def _funding_overview(db: Session, project_id: Optional[int] = None) -> dict:
             eff = inv if inv > 0 else (stl if stl > 0 else est)
         diff = (eff - incl) if eff is not None else None
         contracts_detail.append({
-            "id": c.id, "contract_name": c.contract_name or "", "contract_no": c.contract_no or "",
+            "id": c.id, "contract_name": c.contract_name or "", "original_name": c.original_name or "",
+            "contract_no": c.contract_no or "",
             "party_a": c.party_a or "", "party_b": c.party_b or "",
             "project_id": c.project_id, "project_name": pmap.get(c.project_id, ""),
             "amount_incl_tax": round(incl, 2), "amount_ex_tax": round(c.amount_ex_tax or 0, 2),

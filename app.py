@@ -573,6 +573,39 @@ def api_list_contracts(project_id=None):
         return []
 
 
+# LLM 抽取的合同名可能过于泛化（如「物资设备采购合同」），无法区分具体标的；
+# 此类泛化名回退到原始文件名（去扩展名），并在下拉里附上项目名/编号，便于识别。
+_GENERIC_CONTRACT_NAMES = {
+    "合同", "协议", "采购合同", "物资设备采购合同", "设备采购合同", "技术服务合同",
+    "服务合同", "合作协议", "业务协议", "服务协议", "采购协议", "销售合同",
+    "买卖合同", "采购合同书", "合同书", "协议书",
+}
+
+
+def _contract_display_name(c):
+    """返回合同的可读名称：泛化名（如「物资设备采购合同」）回退到原始文件名，不含 #id/项目前缀。"""
+    name = (c.get("contract_name") or "").strip()
+    orig = (c.get("original_name") or "").strip()
+    if not name or name in _GENERIC_CONTRACT_NAMES:
+        base = os.path.splitext(orig)[0].strip() if orig else ""
+        name = base or name
+    return name or "(未命名)"
+
+
+def _contract_display_label(c, with_project=True):
+    """生成合同的友好显示名：项目名 + #id + 名称 + 编号；名称太泛化时回退原始文件名。"""
+    name = _contract_display_name(c)
+    no = (c.get("contract_no") or "").strip()
+    label = f"#{c['id']}｜{name}"
+    if no:
+        label += f"｜{no}"
+    if with_project:
+        pname = (c.get("project_name") or "").strip()
+        if pname:
+            label = f"{pname} ｜ {label}"
+    return label
+
+
 def api_contract_stats(start=None, end=None, date_field="sign_date", project_id=None):
     try:
         params = {"date_field": date_field}
@@ -1361,7 +1394,7 @@ def render_contract_page():
             rows.append({
                 "ID": c["id"],
                 "解析状态": ps_label,
-                "合同名称": c["contract_name"] or c["original_name"],
+                "合同名称": _contract_display_name(c),
                 "合同编号": c["contract_no"] or "",
                 "甲方": c["party_a"] or "",
                 "乙方": c["party_b"] or "",
@@ -1376,7 +1409,7 @@ def render_contract_page():
                 "剩余天数": c["days_left"] if c["days_left"] is not None else "",
             })
         df = pd.DataFrame(rows)
-        names = [f"#{c['id']}｜{c['contract_name'] or c['original_name']}" for c in items]
+        names = [_contract_display_label(c, with_project=False) for c in items]
         evt = st.dataframe(
             df, use_container_width=True, hide_index=True,
             on_select="rerun", selection_mode="single-row", key="contract_table",
@@ -1394,12 +1427,12 @@ def render_contract_page():
 
     # ===== 详情 / 下载 / 删除 =====
     st.subheader("🔎 合同详情与操作")
-    names = [f"#{c['id']}｜{c['contract_name'] or c['original_name']}" for c in items]
+    names = [_contract_display_label(c, with_project=False) for c in items]
     if names:
         sel = st.selectbox("选择合同", names, key="contract_select")
         c = items[names.index(sel)]
         with st.container(border=True):
-            st.markdown(f"### {c['contract_name'] or c['original_name']}")
+            st.markdown(f"### {_contract_display_name(c)}")
             ps = c.get("processing_status", "done")
             if ps == "processing":
                 st.info("⏳ 该合同正在后台解析中（扫描件 OCR 较慢），请稍后刷新页面查看已抽取的字段。")
@@ -1583,9 +1616,9 @@ def render_contract_page():
             for g in groups:
                 keep = g["keep"]
                 with st.expander(f"重复组：{g['key']}（{g['count']} 份）"):
-                    st.markdown(f"**✅ 保留（最新）**：`{keep.get('contract_name') or keep.get('original_name') or '未命名'}`（ID #{keep['id']}｜{keep.get('created_at', '')}）")
+                    st.markdown(f"**✅ 保留（最新）**：`{_contract_display_name(keep)}`（ID #{keep['id']}｜{keep.get('created_at', '')}）")
                     for r in g["remove"]:
-                        st.markdown(f"　🗑️ 删除：`{r.get('contract_name') or r.get('original_name') or '未命名'}`（ID #{r['id']}｜{r.get('created_at', '')}）")
+                        st.markdown(f"　🗑️ 删除：`{_contract_display_name(r)}`（ID #{r['id']}｜{r.get('created_at', '')}）")
             confirm = st.checkbox("我确认删除以上重复合同（每组保留最新一份）", key="contract_dup_confirm")
             if st.button("⚠️ 一键去重", key="contract_dup_go", disabled=not confirm):
                 res = api_contract_deduplicate()
@@ -2224,7 +2257,7 @@ elif menu == "💰 经费管理":
                         st.caption("该项目暂无关联合同")
                     else:
                         crows = [{
-                            "合同名称": cc.get("contract_name") or f"#{cc['id']}",
+                            "合同名称": _contract_display_name(cc),
                             "合同编号": cc.get("contract_no") or "",
                             "含税金额": fmt_money(cc.get("amount_incl_tax")),
                             "签订日期": cc.get("sign_date") or "",
@@ -2436,7 +2469,7 @@ elif menu == "💰 经费管理":
             crows = []
             for c in contracts:
                 crows.append({
-                    "合同": c["contract_name"] or f"#{c['id']}",
+                    "合同": _contract_display_name(c),
                     "乙方/合作方": c["party_b"] or "",
                     "含税金额": c["amount_incl_tax"],
                     "暂估": c["estimate_total"], "结算": c["settlement_total"], "发票": c["invoice_total"],
@@ -2474,7 +2507,7 @@ elif menu == "💰 经费管理":
                     if not proj_contracts:
                         st.warning("该项目暂无关联合同，请先在「合同管理」关联项目。")
                     else:
-                        ct_labels = {f"#{c['id']}｜{c.get('contract_name') or c.get('original_name')}": c["id"] for c in proj_contracts}
+                        ct_labels = {_contract_display_label(c, with_project=False): c["id"] for c in proj_contracts}
                         default_labels = list(ct_labels.keys())
                         sel_cts = st.multiselect("关联合同（默认全选）", list(ct_labels.keys()), default=default_labels, key="fin_proj_cts")
                         sel_dt = st.selectbox("单据类型", ["发票", "结算单", "暂估单"], key="fin_proj_dt")
@@ -2516,7 +2549,7 @@ elif menu == "💰 经费管理":
                                 st.rerun()
             else:
                 fu1, fu2, fu3 = st.columns(3)
-                ct_opts = {f"#{c['id']}｜{c.get('contract_name') or c.get('original_name')}": c["id"] for c in contracts_all}
+                ct_opts = {_contract_display_label(c, with_project=True): c["id"] for c in contracts_all}
                 sel_ct = fu1.selectbox("关联合同", list(ct_opts.keys()), key="fin_doc_ct")
                 sel_dt = fu2.selectbox("单据类型", ["发票", "结算单", "暂估单"], key="fin_doc_type")
                 up_files = fu3.file_uploader("选择单据文件（可多选）", accept_multiple_files=True, key="fin_doc_uploader")
