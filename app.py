@@ -2228,74 +2228,81 @@ elif menu == "💰 经费管理":
         df = pd.DataFrame(data, columns=col_names)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        # —— 合同金额两行（暂估 / 结算 + 到账）+ 合同清单 + 人工修改 ——
-        st.markdown("**💴 合同金额（年度口径，可人工修改；修改后 override 优先于自动值）**")
-        for r in rows:
-            pid = r["project_id"]
-            ca = contract_amounts.get(str(pid), {})
-            est = ca.get("estimate", 0); est_ov = ca.get("estimate_override", False)
-            stl = ca.get("settlement", 0); stl_ov = ca.get("settlement_override", False)
-            inc = ca.get("income", 0); inc_ov = ca.get("income_override", False)
-            mark_est = "　*（已人工修改）*" if est_ov else ""
-            mark_stl = "　*（已人工修改）*" if stl_ov else ""
-            mark_inc = "　*（已人工修改）*" if inc_ov else ""
-            with st.container(border=True):
-                st.markdown(f"**{r['project_name']}**")
-                r1c1, r1c2 = st.columns([4, 1])
-                r1c1.markdown(f"合同暂估额：{fmt_money(est)}{mark_est}")
-                if r1c2.button("✏️ 修改暂估", key=f"ov_est_{pid}_{year}", use_container_width=True):
-                    st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "estimate", "label": "合同暂估额"}
-                r2c1, r2c2, r2c3 = st.columns([4, 1, 1])
-                r2c1.markdown(f"实际入账额：合同结算金额 {fmt_money(stl)}{mark_stl} ｜ 实际到账流水 {fmt_money(inc)}{mark_inc}")
-                if r2c2.button("✏️ 修改结算", key=f"ov_stl_{pid}_{year}", use_container_width=True):
-                    st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "settlement", "label": "合同结算金额"}
-                if r2c3.button("✏️ 修改到账", key=f"ov_inc_{pid}_{year}", use_container_width=True):
-                    st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "income", "label": "实际到账流水"}
-                clist = ca.get("contracts", [])
-                with st.expander(f"合同清单（{len(clist)} 份）"):
-                    if not clist:
-                        st.caption("该项目暂无关联合同")
-                    else:
-                        crows = [{
-                            "合同名称": _contract_display_name(cc),
-                            "合同编号": cc.get("contract_no") or "",
-                            "含税金额": fmt_money(cc.get("amount_incl_tax")),
-                            "签订日期": cc.get("sign_date") or "",
-                            "本年暂估": fmt_money(cc.get("estimate")),
-                            "本年结算": fmt_money(cc.get("settlement")),
-                        } for cc in clist]
-                        st.dataframe(pd.DataFrame(crows), use_container_width=True, hide_index=True)
+        # —— 合同金额两行（暂估 / 结算 + 到账）+ 合同清单 + 就地人工修改（默认折叠，避免页面冗余）——
+        with st.expander("💴 合同金额（年度口径，可人工修改；修改后 override 优先于自动值）", expanded=False):
+            st.caption("逐项目展示合同暂估额 / 结算额 / 到账额，点「修改」就地编辑；默认折叠以免页面过长。")
+            for r in rows:
+                pid = r["project_id"]
+                ca = contract_amounts.get(str(pid), {})
+                est = ca.get("estimate", 0); est_ov = ca.get("estimate_override", False)
+                stl = ca.get("settlement", 0); stl_ov = ca.get("settlement_override", False)
+                inc = ca.get("income", 0); inc_ov = ca.get("income_override", False)
+                mark_est = "　*（已人工修改）*" if est_ov else ""
+                mark_stl = "　*（已人工修改）*" if stl_ov else ""
+                mark_inc = "　*（已人工修改）*" if inc_ov else ""
+                with st.container(border=True):
+                    st.markdown(f"**{r['project_name']}**")
+                    r1c1, r1c2 = st.columns([4, 1])
+                    r1c1.markdown(f"合同暂估额：{fmt_money(est)}{mark_est}")
+                    if r1c2.button("✏️ 修改暂估", key=f"ov_est_{pid}_{year}", use_container_width=True):
+                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "estimate", "label": "合同暂估额"}
+                    r2c1, r2c2, r2c3 = st.columns([4, 1, 1])
+                    r2c1.markdown(f"实际入账额：合同结算金额 {fmt_money(stl)}{mark_stl} ｜ 实际到账流水 {fmt_money(inc)}{mark_inc}")
+                    if r2c2.button("✏️ 修改结算", key=f"ov_stl_{pid}_{year}", use_container_width=True):
+                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "settlement", "label": "合同结算金额"}
+                    if r2c3.button("✏️ 修改到账", key=f"ov_inc_{pid}_{year}", use_container_width=True):
+                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "income", "label": "实际到账流水"}
 
-        # 人工修改表单（保存 / 恢复自动值 / 取消）
-        ov_edit = st.session_state.get("override_edit")
-        if ov_edit:
-            with st.form(f"override_form_{ov_edit['kind']}_{ov_edit['project_id']}_{ov_edit['year']}"):
-                st.markdown(f"**人工修改：{ov_edit['label']}**（项目 #{ov_edit['project_id']}，年度 {ov_edit['year']}）")
-                new_val = st.number_input("金额（元）", min_value=0.0, step=1000.0, format="%.2f",
-                                          key=f"ov_input_{ov_edit['kind']}_{ov_edit['project_id']}_{ov_edit['year']}")
-                oc1, oc2, oc3 = st.columns([1, 1, 1])
-                save_ov = oc1.form_submit_button("💾 保存")
-                reset_ov = oc2.form_submit_button("↩️ 恢复自动值")
-                cancel_ov = oc3.form_submit_button("取消")
-            if save_ov:
-                r = api_save_contract_amount_override({"project_id": ov_edit["project_id"], "year": ov_edit["year"],
-                                                       "kind": ov_edit["kind"], "amount": new_val})
-                if r and r.status_code == 200:
-                    st.session_state.pop("override_edit", None)
-                    st.rerun()
-                elif r is not None:
-                    st.error(r.text)
-            if reset_ov:
-                r = api_save_contract_amount_override({"project_id": ov_edit["project_id"], "year": ov_edit["year"],
-                                                       "kind": ov_edit["kind"], "amount": None})
-                if r and r.status_code == 200:
-                    st.session_state.pop("override_edit", None)
-                    st.rerun()
-                elif r is not None:
-                    st.error(r.text)
-            if cancel_ov:
-                st.session_state.pop("override_edit", None)
-                st.rerun()
+                    # 就地渲染编辑表单（点击「修改」后立即出现在本项目卡片内）
+                    ov_edit = st.session_state.get("override_edit")
+                    if ov_edit and ov_edit.get("project_id") == pid and ov_edit.get("year") == year:
+                        _cur = {"estimate": est, "settlement": stl, "income": inc}.get(ov_edit["kind"], 0.0)
+                        _inp_key = f"ov_input_{ov_edit['kind']}_{pid}_{year}"
+                        with st.form(f"override_form_{ov_edit['kind']}_{pid}_{year}"):
+                            st.markdown(f"**人工修改：{ov_edit['label']}**（当前自动值 {fmt_money(_cur)}）")
+                            new_val = st.number_input("金额（元）", min_value=0.0, step=1000.0, format="%.2f",
+                                                      value=float(_cur or 0.0), key=_inp_key)
+                            oc1, oc2, oc3 = st.columns([1, 1, 1])
+                            save_ov = oc1.form_submit_button("💾 保存")
+                            reset_ov = oc2.form_submit_button("↩️ 恢复自动值")
+                            cancel_ov = oc3.form_submit_button("取消")
+                        if save_ov:
+                            r = api_save_contract_amount_override({"project_id": pid, "year": year,
+                                                                   "kind": ov_edit["kind"], "amount": new_val})
+                            if r and r.status_code == 200:
+                                st.session_state.pop("override_edit", None)
+                                st.session_state.pop(_inp_key, None)
+                                st.rerun()
+                            elif r is not None:
+                                st.error(r.text)
+                        if reset_ov:
+                            r = api_save_contract_amount_override({"project_id": pid, "year": year,
+                                                                   "kind": ov_edit["kind"], "amount": None})
+                            if r and r.status_code == 200:
+                                st.session_state.pop("override_edit", None)
+                                st.session_state.pop(_inp_key, None)
+                                st.rerun()
+                            elif r is not None:
+                                st.error(r.text)
+                        if cancel_ov:
+                            st.session_state.pop("override_edit", None)
+                            st.session_state.pop(_inp_key, None)
+                            st.rerun()
+
+                    clist = ca.get("contracts", [])
+                    with st.expander(f"合同清单（{len(clist)} 份）"):
+                        if not clist:
+                            st.caption("该项目暂无关联合同")
+                        else:
+                            crows = [{
+                                "合同名称": _contract_display_name(cc),
+                                "合同编号": cc.get("contract_no") or "",
+                                "含税金额": fmt_money(cc.get("amount_incl_tax")),
+                                "签订日期": cc.get("sign_date") or "",
+                                "本年暂估": fmt_money(cc.get("estimate")),
+                                "本年结算": fmt_money(cc.get("settlement")),
+                            } for cc in clist]
+                            st.dataframe(pd.DataFrame(crows), use_container_width=True, hide_index=True)
 
     st.divider()
 
