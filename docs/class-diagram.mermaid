@@ -1,0 +1,60 @@
+classDiagram
+    class Project {
+        +int id
+        +str code
+        +str name
+        +str description
+        +str stage
+        +datetime created_at
+    }
+    class Contract {
+        +int id
+        +int project_id
+        +str contract_name
+        +str contract_no
+        +float amount_value
+        +float amount_incl_tax
+        +float tax_rate
+        +float warranty_ratio
+        +str sign_date
+        +str due_date
+        +int alert_ignored
+    }
+    class FinancialDoc {
+        +int id
+        +int contract_id
+        +int project_id
+        +str doc_type
+        +float amount
+        +float tax_amount
+        +str doc_date
+        +int confirmed
+    }
+    class Funding {
+        +int id
+        +int project_id
+        +str fund_type
+        +float amount
+        +str fund_date
+    }
+    class ProjectContractAmountOverride {
+        +int id
+        +int project_id
+        +int year
+        +str kind
+        +float amount
+        +datetime updated_at
+    }
+    class AlertDismissed {
+        +int id
+        +str alert_key
+        +str category
+        +datetime dismissed_at
+        +str operator
+    }
+
+    Project "1" --> "*" Contract : 拥有合同
+    Project "1" --> "*" FinancialDoc : 拥有单据
+    Contract "1" --> "*" FinancialDoc : 单据归属
+    Project "1" --> "*" Funding : 经费流水
+    Project "1" --> "*" ProjectContractAmountOverride : 金额人工覆盖

@@ -1,0 +1,49 @@
+# 环境变量（含密钥，切勿提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# 数据库
+*.db
+
+# 上传/提取的文件（本地存储）
+uploads/
+data/
+
+# 备份（含数据库+文件，加密）与审计归档
+backups/
+audit_archive/
+
+# QQ 机器人临时文件
+qq_tmp/
+
+# 聊天记录
+chat_history.json
+*.log
+*.log.*
+
+# 项目数据（.workbuddy）
+.workbuddy/
+
+# 业务/科研资料与文档（专利/申报协议/报告等，含敏感信息，勿公开提交）
+项目管理/
+融合*/
+*.pdf
+*.PDF
+*.doc
+*.DOC
+*.docx
+*.DOCX
+*.xls
+*.XLS
+*.xlsx
+*.XLSX
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.ref
+*.gw

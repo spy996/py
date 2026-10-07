@@ -1,0 +1,51 @@
+sequenceDiagram
+    participant U as 用户
+    participant FE as app.py(Streamlit)
+    participant BE as main.py(FastAPI)
+    participant DB as SQLite
+
+    rect rgb(238,245,255)
+    Note over U,DB: 需求9 项目管理聚合
+    U->>FE: 进入「项目管理」选项目
+    FE->>BE: GET /projects/{id}/dashboard
+    BE->>DB: 查 Project/ProjectFile/Contract/Funding/Achievement
+    BE->>BE: _generate_todo_items 算待办(已过滤dismissed)
+    BE-->>FE: {project,metrics,stages,files_by_stage}
+    FE-->>U: 信息卡/6指标/4阶段/资料分组
+    end
+
+    rect rgb(240,253,244)
+    Note over U,DB: 需求8 选项目上传单据
+    U->>FE: 经费管理·按项目上传
+    FE->>BE: GET /contracts?project_id=
+    BE-->>FE: 项目合同列表
+    FE->>FE: 文件名匹配合同并分组
+    FE->>BE: POST /financial-docs(files+contract_id+project_id+doc_type)
+    BE->>DB: 写 FinancialDoc(confirmed=0)
+    BE-->>FE: uploaded
+    FE->>FE: 后台 OCR+LLM 回填金额
+    end
+
+    rect rgb(255,247,237)
+    Note over U,DB: 需求5 一览表金额+人工覆盖
+    U->>FE: 打开年度经费一览表
+    FE->>BE: GET /funding-grid?year=Y
+    BE->>DB: 暂估/结算(FinancialDoc)+到账(Funding)+override
+    BE-->>FE: {rows,cells,contract_amounts}
+    U->>FE: 人工修改暂估/结算/到账
+    FE->>BE: POST /funding-grid/contract-amount-override
+    BE->>DB: upsert ProjectContractAmountOverride
+    BE-->>FE: ok
+    end
+
+    rect rgb(254,242,242)
+    Note over U,DB: 需求6 预警关闭
+    U->>FE: 风险预警·不再提醒
+    FE->>BE: POST /funding/alerts/dismiss {alert_key,category}
+    BE->>DB: INSERT OR IGNORE alert_dismissed
+    BE-->>FE: ok
+    U->>FE: 批量清理已过期
+    FE->>BE: POST /funding/alerts/dismiss-expired
+    BE->>DB: 批量写入过期项 alert_key
+    BE-->>FE: {dismissed_count}
+    end
