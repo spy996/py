@@ -28,6 +28,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 
 from constants import PROJECT_STAGES, AMOUNT_KINDS
 from utils.text_extract import extract_text_from_file, is_supported_file, _pdf_needs_ocr
+from config import BASE_DIR, ENV, UPLOAD_DIR, EXTRACT_DIR, DATABASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_API_URL, logger
+from utils.storage import _content_path, _save_content, _load_content
+from utils.ai import _fallback_terms, _expand_query, _chunk_text, _call_deepseek
 import io
 import logging
 import threading
@@ -43,51 +46,13 @@ from openpyxl import load_workbook
 # OCR 后台线程池：专门跑扫描件 OCR / 合同 / 财务 / 成果 等异步识别，避免上传阻塞
 _ocr_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-bg")
 
-# ============ 配置：环境变量 + .env ============
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _load_env(path: str) -> dict:
-    """轻量 .env 加载：KEY=VALUE，忽略注释和空行（避免额外依赖 python-dotenv）"""
-    env = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
-
-
-ENV = _load_env(os.path.join(BASE_DIR, ".env"))
-
-# 存储路径：文件本体 + 提取文本（默认项目目录下 data/，可在 .env 里用 UPLOAD_DIR 覆盖为任意绝对路径，便于跨电脑迁移）
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", ENV.get("UPLOAD_DIR", os.path.join(BASE_DIR, "data")))
-EXTRACT_DIR = os.path.join(UPLOAD_DIR, "extracted")
-os.makedirs(EXTRACT_DIR, exist_ok=True)
-
-
-DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'rd_platform.db')}"
+# ============ 数据库引擎 ============
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},  # SQLite 专用
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-# ============ DeepSeek 智能问答配置 ============
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", ENV.get("DEEPSEEK_API_KEY", ""))
-DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", ENV.get("DEEPSEEK_API_URL", "https://api.deepseek.com/chat/completions"))
-
-# ============ 日志 ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("rd_platform")
-
 
 # ============ 认证与安全 ============
 def _append_env(key: str, value: str) -> None:
@@ -777,122 +742,9 @@ _maintenance_thread.start()
 
 
 
-# ============ 磁盘文本存储辅助 ============
-def _content_path(stored_name: str) -> str:
-    """根据文件名生成提取文本的磁盘路径"""
-    return os.path.join(EXTRACT_DIR, f"{stored_name}.txt")
-
-
-def _save_content(stored_name: str, content: str) -> None:
-    """把提取的全文文本写到磁盘"""
-    try:
-        with open(_content_path(stored_name), "w", encoding="utf-8") as f:
-            f.write(content or "")
-    except Exception as e:
-        print(f"[存储] 写磁盘失败：{e}")
-
-
-def _load_content(db_file) -> str:
-    """读取文件文本：优先磁盘，其次旧数据库 content 并自动迁移，最后现场提取"""
-    path = _content_path(db_file.stored_name)
-    # 1) 磁盘已有，直接读
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            print(f"[读取] 读磁盘失败：{e}")
-    # 2) 磁盘没有，但旧数据库 content 有数据 → 搬到磁盘
-    if db_file.content and db_file.content.strip():
-        _save_content(db_file.stored_name, db_file.content)
-        return db_file.content
-    # 3) 都没有 → 现场提取并写磁盘
-    if os.path.exists(db_file.file_path):
-        content = extract_text_from_file(db_file.file_path)
-        _save_content(db_file.stored_name, content)
-        return content
-    return ""
-
-# ============ FastAPI 应用 ============
-# ============ 智能问答：资料检索 + DeepSeek 调用 ============
-def _fallback_terms(question: str) -> List[str]:
-    """兜底：把问题拆成中文二元组 + 英文/数字词"""
-    terms = set()
-    cn_chars = re.findall(r"[\u4e00-\u9fff]", question)
-    for i in range(len(cn_chars) - 1):
-        terms.add(cn_chars[i] + cn_chars[i + 1])
-    terms.update(re.findall(r"[A-Za-z0-9_]{2,}", question))
-    if not terms:
-        terms = {question}
-    return list(terms)
-
-
-def _expand_query(question: str) -> List[str]:
-    """用 DeepSeek 把问题扩展成一组检索关键词（含同义词/别名），失败返回空列表"""
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    prompt = (
-        "你是检索专家。请把用户的问题改写成一组用于全文检索的关键词/短语，"
-        "包含同义词、近义词和常见别名，每个词尽量简短。\n"
-        "只输出一个 JSON 字符串数组，不要任何其他文字。\n"
-        "例如问题\"项目的疲劳寿命是多少\" → [\"疲劳寿命\",\"疲劳强度\",\"疲劳\",\"寿命\",\"试验\"]\n\n"
-        f"问题：{question}"
-    )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": 300,
-        "stream": False,
-    }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-    start = raw.find("[")
-    end = raw.rfind("]")
-    if start == -1 or end <= start:
-        return []
-    try:
-        arr = json.loads(raw[start:end + 1])
-    except Exception:
-        return []
-    return [str(x).strip() for x in arr if str(x).strip()]
-
-
-# ---- 检索/回答相关参数 ----
-CHUNK_SIZE = 1200        # 每个文本块的字符数（更细的块，便于精确命中 + 覆盖更多文件）
-CHUNK_OVERLAP = 100      # 相邻块的重叠字符数，避免关键词落在切缝处漏检
+# ---- 检索/回答相关参数（_chunk_text 已抽到 utils/ai.py）----
 MAX_CHUNKS = 40          # 全局最多取多少块（喂给 LLM 的上限）
 PER_FILE_CHUNKS = 8      # 单个文件最多贡献多少块，避免一个超长文件霸占名额
-
-
-def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """把长文本切成带重叠的块，尽量在换行/句号处断开，减少语义截断。"""
-    text = text or ""
-    if len(text) <= size:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        if end < len(text):
-            cut = max(
-                text.rfind("\n", start + size // 2, end),
-                text.rfind("。", start + size // 2, end),
-                text.rfind("；", start + size // 2, end),
-            )
-            if cut > start + size // 2:
-                end = cut + 1
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = max(end - overlap, start + 1)
-    return chunks
 
 
 def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] = None):
@@ -1009,40 +861,6 @@ def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] =
         return chunks_out, list(ref_map.values())
     finally:
         db.close()
-
-def _call_deepseek(question: str, context: str) -> str:
-    """调用 DeepSeek API，仅依据资料回答问题"""
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    system_prompt = (
-        "你是研发知识库的专业研究助手，擅长从多份技术文档中提炼、归纳和综合信息。"
-        "请基于提供的资料，全面、准确地回答用户问题。\n\n"
-        "要求：\n"
-        "1. 优先从资料中提取答案，覆盖资料里的关键信息、数据和结论，不要遗漏重要内容；"
-        "当资料覆盖多个文件/项目时，尽量都照顾到。\n"
-        "2. 可以适当归纳、总结、对比和概括，用清晰的结构（分点、小标题、表格）呈现，"
-        "让回答既全面又好读。\n"
-        "3. 如果资料不足以完整回答，请如实说明，并给出已检索到的相关线索，不要编造、不要硬凑。\n"
-        "4. 涉及具体数据或结论时，自然地注明出处（例如“根据《xxx》记载”或“《xxx》中提到”），"
-        "不要机械地在每个数字后加括号堆砌来源。\n"
-        "5. 语气专业、自然、易读，避免机械罗列和重复。"
-    )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}"},
-        ],
-        "temperature": 0.6,
-        "max_tokens": 8100,
-        "stream": False,
-    }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
 
 
 app = FastAPI(
