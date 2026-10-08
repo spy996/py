@@ -3934,6 +3934,7 @@ def _extract_achievement_fields(content: str, filename: str = "") -> dict:
         '  "status": "状态，从[在研,已授权,已发表,已登记,已获奖,已发布,其他]选一个",\n'
         '  "holder": "权利人/作者/完成人/专利权人",\n'
         '  "achieve_date": "取得日期（授权日/发表日期/获奖日期等），YYYY-MM-DD",\n'
+        '  "application_date": "申请日期（专利/软著等证书上标注的申请日），YYYY-MM-DD，没有则填空串",\n'
         '  "remark": "备注（专利号/刊物/等级/编号等补充信息，可简略）"\n'
         "}\n\n"
         "严格规则：\n"
@@ -3969,6 +3970,7 @@ def _extract_achievement_fields(content: str, filename: str = "") -> dict:
         "status": str(data.get("status") or "").strip(),
         "holder": str(data.get("holder") or "").strip(),
         "achieve_date": str(data.get("achieve_date") or "").strip(),
+        "application_date": str(data.get("application_date") or "").strip(),
         "remark": str(data.get("remark") or "").strip(),
     }
 
@@ -3998,6 +4000,7 @@ def _process_achievement_async(achievement_id: int, file_path: str, original_nam
         a.status = fields.get("status") or "其他"
         a.holder = fields.get("holder") or None
         a.achieve_date = fields.get("achieve_date") or None
+        a.application_date = fields.get("application_date") or None
         a.remark = fields.get("remark") or None
         a.processing_status = "done"
         db.commit()
@@ -4021,7 +4024,7 @@ class AchievementCreate(BaseModel):
     category: Optional[str] = "其他"
     status: Optional[str] = "其他"
     holder: Optional[str] = None
-    accept_date: Optional[str] = None
+    application_date: Optional[str] = None
     achieve_date: Optional[str] = None
     remark: Optional[str] = None
 
@@ -4033,7 +4036,7 @@ class AchievementUpdate(BaseModel):
     category: str = "其他"
     status: str = "其他"
     holder: Optional[str] = None
-    accept_date: Optional[str] = None
+    application_date: Optional[str] = None
     achieve_date: Optional[str] = None
     remark: Optional[str] = None
 
@@ -4047,7 +4050,7 @@ def _achievement_to_dict(a: Achievement, project_name: str = "") -> dict:
         "category": a.category or "其他",
         "status": a.status or "其他",
         "holder": a.holder or "",
-        "accept_date": a.accept_date or "",
+        "application_date": a.application_date or "",
         "achieve_date": a.achieve_date or "",
         "remark": a.remark or "",
         "file_name": a.file_name or "",
@@ -4069,7 +4072,7 @@ def create_achievement(req: AchievementCreate, db: Session = Depends(get_db)):
         category=req.category or "其他",
         status=req.status or "其他",
         holder=req.holder or None,
-        accept_date=req.accept_date or None,
+        application_date=req.application_date or None,
         achieve_date=req.achieve_date or None,
         remark=req.remark or None,
     )
@@ -4086,7 +4089,7 @@ async def create_achievement_manual(
     category: str = Form("其他"),
     status: str = Form("其他"),
     holder: Optional[str] = Form(None),
-    accept_date: Optional[str] = Form(None),
+    application_date: Optional[str] = Form(None),
     achieve_date: Optional[str] = Form(None),
     remark: Optional[str] = Form(None),
     project_id: Optional[int] = Form(None),
@@ -4117,7 +4120,7 @@ async def create_achievement_manual(
         category=category or "其他",
         status=status or "其他",
         holder=holder or None,
-        accept_date=accept_date or None,
+        application_date=application_date or None,
         achieve_date=achieve_date or None,
         remark=remark or None,
         file_name=file_name,
@@ -4189,7 +4192,7 @@ def update_achievement(achievement_id: int, req: AchievementUpdate, db: Session 
     a.category = req.category or "其他"
     a.status = req.status or "其他"
     a.holder = req.holder or None
-    a.accept_date = req.accept_date or None
+    a.application_date = req.application_date or None
     a.achieve_date = req.achieve_date or None
     a.remark = req.remark or None
     db.commit()

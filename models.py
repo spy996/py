@@ -271,7 +271,7 @@ class Achievement(Base):
     category = Column(String, nullable=True)      # 类型：专利/论文/软件著作权/获奖/标准/成果登记/鉴定报告/其他
     status = Column(String, nullable=True)        # 状态：在研/已授权/已发表/已登记/已获奖/已发布/其他
     holder = Column(String, nullable=True)        # 权利人/作者/完成人
-    accept_date = Column(String, nullable=True)   # 受理日期（专利/申请的受理日）
+    application_date = Column(String, nullable=True)   # 申请日期（从专利/软著等证书提取的申请日）
     achieve_date = Column(String, nullable=True)  # 取得日期
     remark = Column(String, nullable=True)        # 备注
     file_name = Column(String, nullable=True)     # 上传的成果文件名（可下载查看）
@@ -360,8 +360,15 @@ if "contracts" in _inspector.get_table_names():
 # 兼容旧数据库：achievements 增加文件关联/识别状态/来源列
 if "achievements" in _inspector.get_table_names():
     _acols = [c["name"] for c in _inspector.get_columns("achievements")]
+    # 旧库 accept_date 列改名为 application_date（受理日期 → 申请日期，语义更正）
+    if "accept_date" in _acols and "application_date" not in _acols:
+        with engine.begin() as _conn:
+            _conn.execute(text("ALTER TABLE achievements RENAME COLUMN accept_date TO application_date"))
+        # 手动更新列名列表（避免 SQLAlchemy inspector 缓存导致重复 ADD COLUMN）
+        _acols = ["application_date" if c == "accept_date" else c for c in _acols]
+        print("[迁移] achievements.accept_date 已重命名为 application_date")
     for _col, _type in [
-        ("accept_date", "VARCHAR"),
+        ("application_date", "VARCHAR"),
         ("file_name", "VARCHAR(500)"),
         ("file_path", "VARCHAR(1000)"),
         ("processing_status", "VARCHAR(20)"),
@@ -388,7 +395,7 @@ if "achievements" in _inspector.get_table_names():
                     category VARCHAR,
                     status VARCHAR,
                     holder VARCHAR,
-                    accept_date VARCHAR,
+                    application_date VARCHAR,
                     achieve_date VARCHAR,
                     remark VARCHAR,
                     file_name VARCHAR(500),
@@ -400,8 +407,8 @@ if "achievements" in _inspector.get_table_names():
                 )
             """))
             _conn.execute(text("""
-                INSERT INTO achievements (id, project_id, name, category, status, holder, accept_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at)
-                SELECT id, project_id, name, category, status, holder, accept_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at
+                INSERT INTO achievements (id, project_id, name, category, status, holder, application_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at)
+                SELECT id, project_id, name, category, status, holder, application_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at
                 FROM achievements_old
             """))
             _conn.execute(text("DROP TABLE achievements_old"))

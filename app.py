@@ -2848,7 +2848,7 @@ elif menu == "🏆 成果台账":
             with c2:
                 category = st.selectbox("类型", cats, key="ach_cat")
                 status = st.selectbox("状态", statuses, key="ach_status")
-                accept_date = st.text_input("受理日期（可选）", placeholder="如：2026-06-15")
+                application_date = st.text_input("申请日期（可选）", placeholder="如：2026-06-15")
                 achieve_date = st.text_input("取得日期（可选）", placeholder="如：2026-09-27")
             remark = st.text_input("备注（可选）")
             manual_file = st.file_uploader("附件（可选，如证书扫描件/证明材料）", key="ach_manual_file")
@@ -2863,7 +2863,7 @@ elif menu == "🏆 成果台账":
                     "category": category,
                     "status": status,
                     "holder": holder.strip() or None,
-                    "accept_date": accept_date.strip() or None,
+                    "application_date": application_date.strip() or None,
                     "achieve_date": achieve_date.strip() or None,
                     "remark": remark.strip() or None,
                 }, file=manual_file)
@@ -2965,7 +2965,7 @@ elif menu == "🏆 成果台账":
                 "类型": a.get("category") or "",
                 "状态": a.get("status") or "",
                 "权利人/作者": a.get("holder") or "",
-                "受理日期": a.get("accept_date") or "",
+                "申请日期": a.get("application_date") or "",
                 "取得日期": a.get("achieve_date") or "",
                 "来源": src_map.get(a.get("source"), a.get("source") or "手动"),
                 "识别状态": proc_map.get(a.get("processing_status"), a.get("processing_status") or "已完成"),
@@ -3005,7 +3005,7 @@ elif menu == "🏆 成果台账":
             with c2:
                 e_category = st.selectbox("类型", cats, index=_opt_index(cats, cur.get("category")), key="ach_edit_cat")
                 e_status = st.selectbox("状态", statuses, index=_opt_index(statuses, cur.get("status")), key="ach_edit_status")
-                e_accept_date = st.text_input("受理日期（可选）", value=cur.get("accept_date") or "", key="ach_edit_accept_date")
+                e_application_date = st.text_input("申请日期（可选）", value=cur.get("application_date") or "", key="ach_edit_application_date")
                 e_date = st.text_input("取得日期（可选）", value=cur.get("achieve_date") or "", key="ach_edit_date")
             e_remark = st.text_input("备注（可选）", value=cur.get("remark") or "", key="ach_edit_remark")
             save_edit = st.form_submit_button("保存修改")
@@ -3019,7 +3019,7 @@ elif menu == "🏆 成果台账":
                     "category": e_category,
                     "status": e_status,
                     "holder": e_holder.strip() or None,
-                    "accept_date": e_accept_date.strip() or None,
+                    "application_date": e_application_date.strip() or None,
                     "achieve_date": e_date.strip() or None,
                     "remark": e_remark.strip() or None,
                 })
