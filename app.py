@@ -29,27 +29,6 @@ requests.delete = _session.delete
 API_BASE = "http://127.0.0.1:8000"
 CHAT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
 
-# 问答范围选项（label → 后端 source_type，镜像 main.py 的 QA_SOURCES，不跨端 import）
-QA_SOURCE_OPTIONS = {
-    "📚 资料": "file",
-    "📄 合同": "contract",
-    "💰 经费": "funding",
-    "🏆 成果": "achievement",
-    "✅ 待办": "todo",
-    "📁 项目信息": "project",
-}
-
-# 引用来源图标（source_type → emoji）
-ICON = {
-    "file": "📄",
-    "document_summary": "📄",
-    "contract": "📄",
-    "funding": "💰",
-    "achievement": "🏆",
-    "todo": "✅",
-    "project": "📁",
-}
-
 st.set_page_config(
     page_title="研发知识智能管理平台",
     page_icon="📚",
@@ -1089,57 +1068,18 @@ def api_documents_summarize(project_id, question):
         return None
 
 
-def api_ask(question, top_k=40, project_id=None, sources=None):
-    """调用后端 /ask 智能问答接口（回答较长时会自动续写，超时放宽到 600s）"""
+def api_ask(question, top_k=5, project_id=None):
+    """调用后端 /ask 智能问答接口（深度回答可能较慢，超时放宽到 300s）"""
     try:
-        payload = {"question": question, "top_k": top_k, "project_id": project_id}
-        if sources:
-            payload["sources"] = sources
         resp = requests.post(
             f"{API_BASE}/ask",
-            json=payload,
-            timeout=600,
+            json={"question": question, "top_k": top_k, "project_id": project_id},
+            timeout=300,
         )
         return resp
     except Exception as e:
         st.error(f"智能问答请求失败：{e}")
         return None
-
-
-def api_ask_stream(question, top_k=40, project_id=None, sources=None, meta=None):
-    """流式调用后端 /ask/stream，逐段 yield 回答文本；结束后把 references/stat_note/error 写入 meta。"""
-    payload = {"question": question, "top_k": top_k, "project_id": project_id}
-    if sources:
-        payload["sources"] = sources
-    if meta is None:
-        meta = {}
-    try:
-        resp = requests.post(f"{API_BASE}/ask/stream", json=payload, stream=True, timeout=600)
-    except Exception as e:
-        meta["error"] = f"智能问答请求失败：{e}"
-        return
-    if resp.status_code != 200:
-        meta["error"] = f"问答失败：{resp.text}"
-        return
-    for raw in resp.iter_lines(decode_unicode=True):
-        if not raw or not raw.startswith("data:"):
-            continue
-        data_str = raw[len("data:"):].strip()
-        if data_str == "[DONE]":
-            break
-        try:
-            obj = json.loads(data_str)
-        except Exception:
-            continue
-        if obj.get("done"):
-            meta["references"] = obj.get("references", [])
-            meta["stat_note"] = obj.get("stat_note", "")
-            break
-        if obj.get("error"):
-            meta["error"] = obj["error"]
-            return
-        if obj.get("delta"):
-            yield obj["delta"]
 
 
 def api_cross_project(question):
@@ -1158,32 +1098,22 @@ def api_cross_project(question):
 
 def render_ask_page():
     st.header("🤖 智能问答")
-    st.caption("基于知识库内容提问，由 DeepSeek 生成答案（依据文档资料与合同/经费/成果/待办等结构化台账）")
+    st.caption("基于知识库内容提问，由 DeepSeek 生成答案（仅依据已上传的文档资料）")
 
     # 启动时从本地文件读取历史，避免刷新/重开后丢失
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = _load_chat_history()
 
-    # ---- 选择要提问的项目 ----
+    # ---- 新增：选择要提问的项目 ----
     projects = api_list_projects()
     project_options = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in projects}
     option_names = ["🌐 全部项目"] + list(project_options.keys())
     selected = st.selectbox(
         "选择要提问的项目",
         option_names,
-        help="选择后，问答只会在该项目的数据里查找",
+        help="选择后，问答只会在该项目的文件里查找资料",
     )
     selected_project_id = None if selected == "🌐 全部项目" else project_options[selected]
-
-    # ---- 问答范围多选 + 智能自动判断开关 ----
-    selected_labels = st.multiselect(
-        "问答范围",
-        list(QA_SOURCE_OPTIONS.keys()),
-        default=list(QA_SOURCE_OPTIONS.keys()),
-        help="选择要检索的数据源；开启「智能自动判断范围」时忽略此选择，由后端检索全部数据源",
-    )
-    auto_scope = st.toggle("智能自动判断范围", value=True)
-    sources = None if auto_scope else [QA_SOURCE_OPTIONS[l] for l in selected_labels]
 
     question = st.text_input("请输入你的问题：", key="ask_input")
 
@@ -1203,8 +1133,17 @@ def render_ask_page():
         if not q:
             st.warning("请先输入问题")
         else:
+            STATS_WORDS = ["统计", "汇总", "一共", "总共", "合计", "总计", "多少份", "多少笔", "有哪些", "分布", "平均"]
+            DOC_WORDS = ["总结", "概览", "梳理", "归纳", "资料", "方案", "报告", "纪要", "文档"]
+            is_doc = selected_project_id is not None and any(w in q for w in DOC_WORDS)
+            is_stats = selected_project_id is not None and any(w in q for w in STATS_WORDS)
             with st.spinner("正在检索资料并生成答案，请稍候……"):
-                resp = api_ask(q, top_k=40, project_id=selected_project_id, sources=sources)
+                if is_doc:
+                    resp = api_documents_summarize(selected_project_id, q)
+                elif is_stats:
+                    resp = api_project_stats(selected_project_id, q)
+                else:
+                    resp = api_ask(q, top_k=1100, project_id=selected_project_id)
 
             if resp is None:
                 pass  # 错误已在 api_ask 中提示
@@ -1212,42 +1151,36 @@ def render_ask_page():
                 st.error(f"问答失败：{resp.text}")
             else:
                 data = resp.json()
+                answer = data.get("answer", "")
+                references = data.get("references", [])
                 st.session_state.chat_history.append({
                     "question": q,
-                    "answer": data.get("answer", ""),
-                    "references": data.get("references", []),
-                    "stat_note": data.get("stat_note", ""),
+                    "answer": answer,
+                    "references": references,
                 })
                 _save_chat_history(st.session_state.chat_history)
 
     # 显示聊天历史（最新在前，不用往下滚动）
     if not st.session_state.chat_history:
         st.info("还没有提问记录，试试问一个知识库里已有的问题吧。")
-    for h_idx, item in enumerate(reversed(st.session_state.chat_history)):
+    for item in reversed(st.session_state.chat_history):
         st.markdown(f"**🙋 你：** {item['question']}")
         st.markdown(f"**🤖 AI：** {item['answer']}")
-        if item.get("stat_note"):
-            st.caption(f"📐 统计口径：{item['stat_note']}")
         if item.get("references"):
             st.markdown("**📎 参考资料：**")
-            for r_idx, ref in enumerate(item["references"]):
-                stype = ref.get("source_type", "file")
-                label = ref.get("label") or ref.get("original_name", "未命名")
+            for ref in item["references"]:
+                fname = ref.get("original_name", "未命名")
+                pname = ref.get("project_name", "")
+                cat = ref.get("category", "") or "其他"
+                dtype = ref.get("doc_type", "") or ""
+                stage = ref.get("stage", "") or ""
+                tags = " ｜ ".join(t for t in [cat, dtype, stage] if t)
                 dl = ref.get("download_url", "")
-                jump = ref.get("jump_url", "")
-                pid = ref.get("project_id")
-                st.markdown(f"- {ICON.get(stype, '📄')} **{label}**")
-                _c_dl, _c_jump, _c_spacer = st.columns([1, 1, 6])
-                with _c_dl:
-                    if stype in ("contract", "achievement", "file", "document_summary") and dl:
-                        tok = st.session_state.get("token", "")
-                        st.markdown(f"[⬇️ 下载]({API_BASE}{dl}?token={tok})")
-                with _c_jump:
-                    if jump:
-                        target_menu = _todo_label if stype == "todo" else jump
-                        if st.button("🔗 查看", key=f"qa_jump_{h_idx}_{r_idx}"):
-                            st.session_state["_nav_target"] = (target_menu, pid)
-                            st.rerun()
+                line = f"- 📄 **{fname}**（{pname}）" + (f" ｜ {tags}" if tags else "")
+                if dl:
+                    tok = st.session_state.get("token", "")
+                    line += f"　[⬇️ 下载]({API_BASE}{dl}?token={tok})"
+                st.markdown(line)
                 if ref.get("snippet"):
                     st.caption(f"　　片段：{ref['snippet']}")
         st.divider()
