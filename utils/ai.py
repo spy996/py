@@ -11,6 +11,8 @@ from config import DEEPSEEK_API_KEY, DEEPSEEK_API_URL
 CHUNK_SIZE = 1200        # 每个文本块的字符数（更细的块，便于精确命中 + 覆盖更多文件）
 CHUNK_OVERLAP = 100      # 相邻块的重叠字符数，避免关键词落在切缝处漏检
 
+MAX_CONTINUATIONS = 3    # 回答被 max_tokens 截断时，最多自动续写次数（防无限循环）
+
 
 def _fallback_terms(question: str) -> List[str]:
     """兜底：把问题拆成中文二元组 + 英文/数字词"""
@@ -86,13 +88,13 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 
 
 def _call_deepseek(question: str, context: str) -> str:
-    """调用 DeepSeek API，仅依据资料回答问题"""
+    """调用 DeepSeek API，仅依据资料回答问题；若回答被 max_tokens 截断，自动续写补齐。"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
     }
     system_prompt = (
-        "你是研发知识库的专业研究助手，擅长从多份技术文档中提炼、归纳和综合信息。"
+        "你是研发知识库的专业研究助手，擅长从文件资料与结构化台账（合同、经费、成果、待办、项目信息、资料摘要）中提炼、归纳和综合信息。"
         "请基于提供的资料，全面、准确地回答用户问题。\n\n"
         "要求：\n"
         "1. 优先从资料中提取答案，覆盖资料里的关键信息、数据和结论，不要遗漏重要内容；"
@@ -102,19 +104,44 @@ def _call_deepseek(question: str, context: str) -> str:
         "3. 如果资料不足以完整回答，请如实说明，并给出已检索到的相关线索，不要编造、不要硬凑。\n"
         "4. 涉及具体数据或结论时，自然地注明出处（例如“根据《xxx》记载”或“《xxx》中提到”），"
         "不要机械地在每个数字后加括号堆砌来源。\n"
-        "5. 语气专业、自然、易读，避免机械罗列和重复。"
+        "5. 语气专业、自然、易读，避免机械罗列和重复。\n"
+        "6. 当上下文中出现【精确统计结果】标记时，这些数字已由系统精确计算，请直接引用，"
+        "不要自行重新计算、数数或估算；若是分组计数（如「已授权:86，已登记:18」），各数字是并列的分类计数，"
+        "不要把它们相加当成总数；涉及统计请注明统计口径。\n"
+        "7. 对于「有多少/有哪些/清单/列表」这类统计或列举问题，请简洁地报出总数与分类，"
+        "再举 2~3 个示例即可，不要逐条罗列全部明细；完整明细清单由系统在「参考资料」中提供，"
+        "你可在回答末尾用一句话提示「完整清单见参考资料」，不要抱怨资料不完整或缺失。"
     )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}"},
-        ],
-        "temperature": 0.6,
-        "max_tokens": 8100,
-        "stream": False,
-    }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}"},
+    ]
+
+    parts = []
+    for _ in range(MAX_CONTINUATIONS + 1):  # 首次回答 + 最多 MAX_CONTINUATIONS 次续写
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": 8100,
+            "stream": False,
+        }
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        choice = data["choices"][0]
+        content = choice["message"]["content"] or ""
+        finish_reason = choice.get("finish_reason", "")
+        if content:
+            parts.append(content)
+        # 仅在「因长度截断」且确实生成了内容时才续写，避免死循环
+        if finish_reason != "length" or not content:
+            break
+        messages.append({"role": "assistant", "content": content})
+        messages.append({
+            "role": "user",
+            "content": "请继续补充，从上一次中断处接着写，直接输出剩余内容，不要重复已经写过的部分。",
+        })
+
+    return "".join(parts)

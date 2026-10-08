@@ -20,7 +20,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request, Form
 from fastapi.responses import FileResponse, Response, JSONResponse
-from sqlalchemy import text
+from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
 from constants import PROJECT_STAGES, AMOUNT_KINDS
@@ -59,11 +59,544 @@ start_maintenance_thread()
 MAX_CHUNKS = 40          # 全局最多取多少块（喂给 LLM 的上限）
 PER_FILE_CHUNKS = 8      # 单个文件最多贡献多少块，避免一个超长文件霸占名额
 
+# ---- 多源问答：数据源枚举 + 配额（保底 min / 上限 max）----
+QA_SOURCES = ["file", "contract", "funding", "achievement", "todo", "project", "document_summary"]
 
-def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] = None):
-    """分块检索：把每个文件切成带重叠的文本块，逐块按关键词打分，取全局最高分的若干块。
-    这样大文件的任意相关段落都能被命中（而不是只截取文件开头），多个文件也能公平竞争。
-    返回 (chunks, references)，chunks 为 [{label, text, file_id, ...}] 列表。"""
+SOURCE_QUOTA = {
+    "file":             {"min": 4,  "max": 16},   # 文件内部仍沿用「每文件保底 1 块 + 单文件上限 8」
+    "contract":         {"min": 2,  "max": 6},
+    "funding":          {"min": 1,  "max": 4},
+    "achievement":      {"min": 2,  "max": 6},
+    "todo":             {"min": 2,  "max": 6},
+    "project":          {"min": 1,  "max": 3},
+    "document_summary": {"min": 1,  "max": 4},
+}
+
+EXACT_BONUS = 5.0       # 精确字段命中加成（合同编号 / 项目编码 / 成果名称）
+
+LIST_CONTEXT_CAP = 5    # 明细类统计喂给 LLM 的「示例」条数上限（references 仍返回全量，供前端逐条查看）
+
+
+# ============ 多源问答：卡片文本化 / 打分 / 装配 ============
+def _fmt_money(v) -> str:
+    """金额规范化：千分位 + 保留两位；空值/非法值兜底为 0.00。"""
+    try:
+        val = float(v or 0)
+    except (TypeError, ValueError):
+        val = 0.0
+    return f"{val:,.2f}"
+
+
+def _fmt_pct(v) -> str:
+    """比例规范化：ratio*100 保留一位 + %；空值/非法值兜底为 0.0%。"""
+    try:
+        val = float(v or 0)
+    except (TypeError, ValueError):
+        val = 0.0
+    return f"{round(val * 100, 1)}%"
+
+
+def _fmt_date(s) -> str:
+    """日期规范化：经 _parse_date 解析成功则输出 YYYY-MM-DD，失败原样返回。"""
+    if not s:
+        return ""
+    d = _parse_date(s)
+    return d.strftime("%Y-%m-%d") if d else str(s)
+
+
+def _contract_to_card(c: Contract, pname: str = "") -> dict:
+    """Contract → 知识片段 card（结构化记录不切块，空字段整段跳过）。"""
+    name = c.contract_name or c.original_name
+    segs = [f"【合同】《{name}》"]
+    if c.contract_no:
+        segs.append(f"编号{c.contract_no}")
+    if c.party_a:
+        segs.append(f"甲方{c.party_a}")
+    if c.party_b:
+        segs.append(f"乙方{c.party_b}")
+    if c.amount_value:
+        segs.append(f"合同金额{_fmt_money(c.amount_value)}{c.currency or ''}")
+    _amt_parts = []
+    if c.amount_incl_tax:
+        _amt_parts.append(f"含税{_fmt_money(c.amount_incl_tax)}")
+    if c.amount_ex_tax:
+        _amt_parts.append(f"不含税{_fmt_money(c.amount_ex_tax)}")
+    if _amt_parts:
+        segs.append("（" + "，".join(_amt_parts) + "）")
+    if c.contract_type:
+        segs.append(f"类型{c.contract_type}")
+    if c.sign_date:
+        segs.append(f"签署日期{_fmt_date(c.sign_date)}")
+    if c.term:
+        segs.append(f"履约期限{c.term}")
+    if c.due_date:
+        segs.append(f"到期日{_fmt_date(c.due_date)}")
+    if c.warranty_ratio:
+        segs.append(f"质保金比例{_fmt_pct(c.warranty_ratio)}")
+    status, _ = _contract_status(c.due_date)
+    segs.append(f"状态{status}")
+    if pname:
+        segs.append(f"所属项目{pname}")
+    text = "，".join(segs)
+    label = f"合同《{name}》（编号{c.contract_no or '无'}，项目：{pname or '未关联'}）"
+    return {
+        "source_type": "contract",
+        "source_id": c.id,
+        "chunk_index": None,
+        "title": name,
+        "label": label,
+        "text": text,
+        "project_id": c.project_id,
+        "project_name": pname,
+        "file_id": None,
+        "ref": {
+            "source_type": "contract",
+            "source_id": c.id,
+            "label": label,
+            "project_id": c.project_id,
+            "project_name": pname,
+            "download_url": f"/contracts/{c.id}/download",
+            "jump_url": "📑 合同管理",
+            "snippet": text,
+        },
+    }
+
+
+def _funding_to_card(f: Funding, pname: str = "") -> dict:
+    """Funding → 知识片段 card。"""
+    segs = [f"【经费】{pname or '未关联项目'}"]
+    if f.item_name:
+        segs.append(f"科目{f.item_name}")
+    if f.fund_type:
+        segs.append(f"类型{f.fund_type}")
+    segs.append(f"金额{_fmt_money(f.amount)}元")
+    if f.fund_date:
+        segs.append(f"日期{_fmt_date(f.fund_date)}")
+    if f.remark:
+        segs.append(f"备注{f.remark}")
+    text = "，".join(segs)
+    title = f.item_name or ""
+    label = f"经费「{f.item_name}」（项目：{pname or '未关联'}）"
+    return {
+        "source_type": "funding",
+        "source_id": f.id,
+        "chunk_index": None,
+        "title": title,
+        "label": label,
+        "text": text,
+        "project_id": f.project_id,
+        "project_name": pname,
+        "file_id": None,
+        "ref": {
+            "source_type": "funding",
+            "source_id": f.id,
+            "label": label,
+            "project_id": f.project_id,
+            "project_name": pname,
+            "download_url": "",
+            "jump_url": "💰 经费管理",
+            "snippet": text,
+        },
+    }
+
+
+def _achievement_to_card(a: Achievement, pname: str = "") -> dict:
+    """Achievement → 知识片段 card。"""
+    segs = [f"【成果】{pname or '未关联项目'}"]
+    if a.name:
+        segs.append(f"名称{a.name}")
+    if a.category:
+        segs.append(f"类型{a.category}")
+    if a.status:
+        segs.append(f"状态{a.status}")
+    if a.holder:
+        segs.append(f"权利人{a.holder}")
+    if a.achieve_date:
+        segs.append(f"取得日期{_fmt_date(a.achieve_date)}")
+    if a.remark:
+        segs.append(f"备注{a.remark}")
+    text = "，".join(segs)
+    title = a.name or ""
+    label = f"成果「{a.name or '未命名'}」（项目：{pname or '未关联'}）"
+    download_url = f"/achievements/{a.id}/download" if a.file_path else ""
+    return {
+        "source_type": "achievement",
+        "source_id": a.id,
+        "chunk_index": None,
+        "title": title,
+        "label": label,
+        "text": text,
+        "project_id": a.project_id,
+        "project_name": pname,
+        "file_id": None,
+        "ref": {
+            "source_type": "achievement",
+            "source_id": a.id,
+            "label": label,
+            "project_id": a.project_id,
+            "project_name": pname,
+            "download_url": download_url,
+            "jump_url": "🏆 成果台账",
+            "snippet": text,
+        },
+    }
+
+
+def _todo_to_card(t: Todo, pname: str = "", project_id: Optional[int] = None) -> dict:
+    """Todo → 知识片段 card（project_id 经 _todo_project_map 反查补入）。"""
+    segs = [f"【待办】{t.category or ''}"]
+    if t.title:
+        segs.append(t.title)
+    if t.level:
+        segs.append(f"级别{t.level}")
+    if t.detail:
+        segs.append(f"详情{t.detail}")
+    if t.status:
+        segs.append(f"状态{t.status}")
+    if t.link:
+        segs.append(f"关联模块{t.link}")
+    text = "，".join(segs)
+    title = t.title or ""
+    label = f"待办「{t.title}」（项目：{pname or '未关联'}）"
+    return {
+        "source_type": "todo",
+        "source_id": t.id,
+        "chunk_index": None,
+        "title": title,
+        "label": label,
+        "text": text,
+        "project_id": project_id,
+        "project_name": pname,
+        "file_id": None,
+        "ref": {
+            "source_type": "todo",
+            "source_id": t.id,
+            "label": label,
+            "project_id": project_id,
+            "project_name": pname,
+            "download_url": "",
+            "jump_url": "✅ 待办模块",
+            "snippet": text,
+        },
+    }
+
+
+def _project_to_card(p: Project) -> dict:
+    """Project → 知识片段 card。"""
+    segs = [f"【项目】{p.name}"]
+    if p.code:
+        segs.append(f"编码{p.code}")
+    if p.stage:
+        segs.append(f"当前阶段{p.stage}")
+    if p.description:
+        segs.append(f"简介{p.description}")
+    text = "，".join(segs)
+    label = f"项目「{p.name}」（编码{p.code}）"
+    return {
+        "source_type": "project",
+        "source_id": p.id,
+        "chunk_index": None,
+        "title": p.name,
+        "label": label,
+        "text": text,
+        "project_id": p.id,
+        "project_name": p.name,
+        "file_id": None,
+        "ref": {
+            "source_type": "project",
+            "source_id": p.id,
+            "label": label,
+            "project_id": p.id,
+            "project_name": p.name,
+            "download_url": "",
+            "jump_url": "📌 项目管理",
+            "snippet": text,
+        },
+    }
+
+
+def _doc_summary_to_card(d: DocumentSummary, pname: str = "") -> dict:
+    """DocumentSummary → 知识片段 card（全文块优先，装配阶段按 file_id 去重）。"""
+    text = f"【资料摘要】{d.doc_type or ''}：{d.summary or ''}"
+    label = f"资料摘要「{d.doc_type or '未分类'}」（项目：{pname or '未关联'}）"
+    return {
+        "source_type": "document_summary",
+        "source_id": d.id,
+        "chunk_index": None,
+        "title": d.doc_type or "",
+        "label": label,
+        "text": text,
+        "project_id": d.project_id,
+        "project_name": pname,
+        "file_id": d.file_id,
+        "ref": {
+            "source_type": "document_summary",
+            "source_id": d.id,
+            "label": label,
+            "project_id": d.project_id,
+            "project_name": pname,
+            "download_url": f"/files/{d.file_id}/download" if d.file_id else "",
+            "jump_url": "📁 文件管理",
+            "snippet": text,
+        },
+    }
+
+
+def _score_card(text: str, title: str, exact_fields: str, kw_lower: List[str]) -> float:
+    """单卡片打分：词频加权 + 标题命中 *3 + 精确字段命中加成（EXACT_BONUS）。"""
+    text_lower = (text or "").lower()
+    title_lower = (title or "").lower()
+    exact_lower = (exact_fields or "").lower()
+    base = 0.0
+    for k in kw_lower:
+        cnt = text_lower.count(k)
+        if cnt > 0:
+            base += cnt * max(1.0, len(k) / 2)
+    name_bonus = sum(max(1, len(k) // 2) for k in kw_lower if k in title_lower) * 3
+    exact_bonus = EXACT_BONUS if exact_lower and any(k in exact_lower for k in kw_lower) else 0.0
+    return base + name_bonus + exact_bonus
+
+
+def _collect_file_cards(db: Session, kw_lower: List[str], project_id: Optional[int]) -> list:
+    """文件全文切块 + 打分（复用原逻辑，文件名命中加成已并入 title 命中）。"""
+    cards = []
+    query = db.query(ProjectFile, Project).join(Project, ProjectFile.project_id == Project.id)
+    if project_id is not None:
+        query = query.filter(ProjectFile.project_id == project_id)
+    for f, p in query.all():
+        try:
+            content = _load_content(f)
+        except Exception as e:
+            logger.warning(f"[问答] 读取文件内容失败（已跳过）{f.original_name}：{e}")
+            continue
+        if not content or not content.strip():
+            continue
+        name_bonus = sum(max(1, len(k) // 2) for k in kw_lower if k in f.original_name.lower()) * 3
+        for ci, ch in enumerate(_chunk_text(content)):
+            chl = ch.lower()
+            score = 0.0
+            snippet = ""
+            for k in kw_lower:
+                cnt = chl.count(k)
+                if cnt > 0:
+                    score += cnt * max(1.0, len(k) / 2)
+                    if not snippet:
+                        snippet = _make_snippet(ch, k)
+            if score <= 0:
+                continue
+            label = f"{f.original_name}（项目：{p.name}"
+            if f.doc_type:
+                label += f"，{f.doc_type}"
+            label += f"，第{ci + 1}段）"
+            cards.append({
+                "source_type": "file",
+                "source_id": f.id,
+                "chunk_index": ci,
+                "title": f.original_name,
+                "label": label,
+                "text": ch,
+                "project_id": p.id,
+                "project_name": p.name,
+                "file_id": f.id,
+                "score": score + name_bonus,
+                "ref": {
+                    "source_type": "file",
+                    "source_id": f.id,
+                    "label": label,
+                    "project_id": p.id,
+                    "project_name": p.name,
+                    "download_url": f"/files/{f.id}/download",
+                    "jump_url": "📁 文件管理",
+                    "snippet": snippet,
+                },
+            })
+    return cards
+
+
+def _todo_project_map(db: Session) -> dict:
+    """从 _generate_todo_items 反查 (category, source_id) -> project_id，供待办单项目过滤。"""
+    mapping = {}
+    try:
+        for it in _generate_todo_items(db):
+            key = (it.get("category"), it.get("source_id"))
+            if key not in mapping:
+                mapping[key] = it.get("project_id")
+    except Exception as e:
+        logger.warning(f"[问答] 待办项目映射生成失败：{e}")
+    return mapping
+
+
+def _collect_cards(db: Session, kw_lower: List[str], sources: Optional[List[str]], project_id: Optional[int]) -> list:
+    """按 sources 汇总各源 cards（结构源逐条文本化 + 打分；文件源走 _collect_file_cards）。"""
+    if not sources:
+        sources = list(QA_SOURCES)
+    else:
+        sources = [s for s in sources if s in QA_SOURCES]
+        if not sources:
+            sources = list(QA_SOURCES)
+
+    cards = []
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+
+    if "file" in sources:
+        cards.extend(_collect_file_cards(db, kw_lower, project_id))
+
+    if "contract" in sources:
+        q = db.query(Contract)
+        if project_id is not None:
+            q = q.filter(Contract.project_id == project_id)
+        for c in q.all():
+            card = _contract_to_card(c, pmap.get(c.project_id, ""))
+            card["score"] = _score_card(card["text"], card["title"], c.contract_no or "", kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    if "funding" in sources:
+        q = db.query(Funding)
+        if project_id is not None:
+            q = q.filter(Funding.project_id == project_id)
+        for f in q.all():
+            card = _funding_to_card(f, pmap.get(f.project_id, ""))
+            card["score"] = _score_card(card["text"], card["title"], "", kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    if "achievement" in sources:
+        q = db.query(Achievement)
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        for a in q.all():
+            card = _achievement_to_card(a, pmap.get(a.project_id, ""))
+            _exact = " ".join(x for x in (a.name, a.category, a.status) if x)
+            card["score"] = _score_card(card["text"], card["title"], _exact, kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    if "todo" in sources:
+        todo_pmap = _todo_project_map(db)
+        for t in db.query(Todo).all():
+            pid = todo_pmap.get((t.category, t.source_id))
+            if project_id is not None and pid != project_id:
+                continue
+            card = _todo_to_card(t, pmap.get(pid, "") if pid else "", pid)
+            card["score"] = _score_card(card["text"], card["title"], "", kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    if "project" in sources:
+        q = db.query(Project)
+        if project_id is not None:
+            q = q.filter(Project.id == project_id)
+        for p in q.all():
+            card = _project_to_card(p)
+            card["score"] = _score_card(card["text"], card["title"], p.code or "", kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    if "document_summary" in sources:
+        q = db.query(DocumentSummary)
+        if project_id is not None:
+            q = q.filter(DocumentSummary.project_id == project_id)
+        for d in q.all():
+            card = _doc_summary_to_card(d, pmap.get(d.project_id, ""))
+            card["score"] = _score_card(card["text"], card["title"], "", kw_lower)
+            if card["score"] > 0:
+                cards.append(card)
+
+    return cards
+
+
+def _apply_quota(scored: list, max_chunks: int) -> list:
+    """按 SOURCE_QUOTA 装配：每源保底 min 条 → 剩余名额按全局分数填充（每源上限 max）。
+    文件源额外沿用「每文件保底 1 块 + 单文件上限 PER_FILE_CHUNKS」；DocumentSummary 与全文块按 file_id 去重。"""
+    scored = sorted(scored, key=lambda c: c["score"], reverse=True)
+    chosen = []
+    chosen_keys = set()        # (source_type, source_id, chunk_index)
+    source_taken = {}          # source_type -> count
+    file_taken = {}            # file_id -> count（仅 file 源）
+    seen_file_ids = set()      # 已入选文件全文块的 file_id，用于摘要去重
+
+    def _push(card):
+        chosen_keys.add((card["source_type"], card["source_id"], card["chunk_index"]))
+        chosen.append(card)
+        source_taken[card["source_type"]] = source_taken.get(card["source_type"], 0) + 1
+        if card["source_type"] == "file":
+            file_taken[card["file_id"]] = file_taken.get(card["file_id"], 0) + 1
+            seen_file_ids.add(card["file_id"])
+
+    def _can_push(card):
+        if (card["source_type"], card["source_id"], card["chunk_index"]) in chosen_keys:
+            return False
+        if card["source_type"] == "document_summary" and card["file_id"] in seen_file_ids:
+            return False
+        return True
+
+    # 1) 每源保底 min 条
+    for stype in QA_SOURCES:
+        if len(chosen) >= max_chunks:
+            break
+        quota = SOURCE_QUOTA.get(stype, {"min": 0, "max": 0})
+        if stype == "file":
+            # 先每文件保底 1 块（封顶 file 源 min，避免贪婪塞满 max_chunks 饿死其他源）
+            for card in scored:
+                if len(chosen) >= max_chunks:
+                    break
+                if source_taken.get("file", 0) >= quota["min"]:
+                    break
+                if card["source_type"] != "file":
+                    continue
+                if not _can_push(card):
+                    continue
+                if card["file_id"] in file_taken:
+                    continue
+                _push(card)
+            # 再补足 file 源 min 条（受每文件上限约束）
+            need = quota["min"] - source_taken.get("file", 0)
+            if need > 0:
+                for card in scored:
+                    if len(chosen) >= max_chunks or need <= 0:
+                        break
+                    if card["source_type"] != "file":
+                        continue
+                    if not _can_push(card):
+                        continue
+                    if file_taken.get(card["file_id"], 0) >= PER_FILE_CHUNKS:
+                        continue
+                    _push(card)
+                    need -= 1
+        else:
+            need = quota["min"]
+            for card in scored:
+                if len(chosen) >= max_chunks or need <= 0:
+                    break
+                if card["source_type"] != stype:
+                    continue
+                if not _can_push(card):
+                    continue
+                _push(card)
+                need -= 1
+
+    # 2) 剩余名额按全局分数填充，每源累计不超过 max
+    if len(chosen) < max_chunks:
+        for card in scored:
+            if len(chosen) >= max_chunks:
+                break
+            stype = card["source_type"]
+            quota = SOURCE_QUOTA.get(stype, {"min": 0, "max": 0})
+            if source_taken.get(stype, 0) >= quota["max"]:
+                continue
+            if not _can_push(card):
+                continue
+            if stype == "file" and file_taken.get(card["file_id"], 0) >= PER_FILE_CHUNKS:
+                continue
+            _push(card)
+
+    return chosen
+
+
+def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] = None, sources: Optional[List[str]] = None):
+    """多源混合检索。sources 为空/None 时检索全部 QA_SOURCES。
+    返回 (chunks, references)；chunks 为 card 列表，references 为统一结构列表。"""
     question = (question or "").strip()
     if not question:
         return [], []
@@ -84,96 +617,310 @@ def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] =
 
     db = SessionLocal()
     try:
-        query = (
-            db.query(ProjectFile, Project)
-            .join(Project, ProjectFile.project_id == Project.id)
-        )
-        if project_id is not None:
-            query = query.filter(ProjectFile.project_id == project_id)
-        rows = query.all()
-
-        # 2) 逐块打分（词频加权，文件名命中给少量加成）
-        scored_chunks = []
-        for f, p in rows:
-            content = _load_content(f)
-            if not content.strip():
-                continue
-            name_bonus = sum(max(1, len(k) // 2) for k in kw_lower if k in f.original_name.lower()) * 3
-            for ci, ch in enumerate(_chunk_text(content)):
-                chl = ch.lower()
-                score = 0.0
-                snippet = ""
-                for k in kw_lower:
-                    cnt = chl.count(k)
-                    if cnt > 0:
-                        score += cnt * max(1.0, len(k) / 2)   # 长关键词权重更高，命中更精准
-                        if not snippet:
-                            snippet = _make_snippet(ch, k)
-                if score > 0:
-                    scored_chunks.append((score + name_bonus, f, p, ci, ch, snippet))
-
-        if not scored_chunks:
+        cards = _collect_cards(db, kw_lower, sources, project_id)
+        if not cards:
             return [], []
-
-        scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-        # 3) 选择：先每个文件保底取 1 块（保证所有相关文件都有代表，避免少数高分文件霸占名额），
-        #    再按分数填充剩余名额（单文件设上限）
-        chosen = []
-        file_taken = {}
-        chosen_keys = set()  # (file_id, chunk_index)，避免同一块重复入选
-
-        for score, f, p, ci, ch, snippet in scored_chunks:
-            if f.id in file_taken:
-                continue
-            chosen.append((f, p, ci, ch, snippet))
-            file_taken[f.id] = 1
-            chosen_keys.add((f.id, ci))
-            if len(chosen) >= max_chunks:
-                break
-
-        if len(chosen) < max_chunks:
-            for score, f, p, ci, ch, snippet in scored_chunks:
-                if (f.id, ci) in chosen_keys:
-                    continue
-                if file_taken.get(f.id, 0) >= PER_FILE_CHUNKS:
-                    continue
-                chosen.append((f, p, ci, ch, snippet))
-                file_taken[f.id] = file_taken.get(f.id, 0) + 1
-                chosen_keys.add((f.id, ci))
-                if len(chosen) >= max_chunks:
-                    break
-
-        chunks_out = []
-        ref_map = {}
-        for f, p, ci, ch, snippet in chosen:
-            label = f"{f.original_name}（项目：{p.name}"
-            if f.doc_type:
-                label += f"，{f.doc_type}"
-            label += f"，第{ci + 1}段）"
-            chunks_out.append({
-                "label": label,
-                "text": ch,
-                "file_id": f.id,
-                "original_name": f.original_name,
-                "snippet": snippet,
+        chosen = _apply_quota(cards, max_chunks)
+        chunks = []
+        references = []
+        for c in chosen:
+            chunks.append({
+                "source_type": c["source_type"],
+                "label": c["label"],
+                "text": c["text"],
+                "snippet": c["ref"].get("snippet", ""),
+                "project_id": c["project_id"],
+                "project_name": c["project_name"],
             })
-            ref_map.setdefault(f.id, {
-                "file_id": f.id,
-                "original_name": f.original_name,
-                "project_id": p.id,
-                "project_name": p.name,
-                "project_code": p.code,
-                "category": f.category or "其他",
-                "doc_type": f.doc_type or "",
-                "stage": f.stage or "",
-                "download_url": f"/files/{f.id}/download",
-                "snippet": snippet,
-            })
-
-        return chunks_out, list(ref_map.values())
+            references.append(c["ref"])
+        return chunks, references
     finally:
         db.close()
+
+
+# ============ 统计意图路由 + 聚合 ============
+STAT_VERBS = ["一共", "总共", "多少", "多少份", "多少笔", "多少项", "合计", "总计", "求和", "总金额",
+              "汇总", "统计", "分布", "平均", "到账", "结余", "预算", "支出", "累计", "共有", "有几", "几个", "几份", "几笔",
+              "总数", "共计", "数量", "有哪些", "哪些", "清单", "列表", "列出", "都有"]
+
+STAT_QUERIES = [
+    {"name": "contract_count_total",       "kind": "agg",  "entities": ["合同"]},
+    {"name": "contract_amount_total",      "kind": "agg",  "entities": ["合同"], "verbs": ["金额", "合计", "总计", "总金额"]},
+    {"name": "contract_count_by_type",     "kind": "agg",  "entities": ["合同"], "verbs": ["类型", "分布"]},
+    {"name": "contract_count_by_status",   "kind": "agg",  "entities": ["合同"], "verbs": ["状态", "超期", "临期"]},
+    {"name": "funding_income",             "kind": "agg",  "entities": ["经费", "资金"], "verbs": ["到账"]},
+    {"name": "funding_budget",             "kind": "agg",  "entities": ["经费", "资金"], "verbs": ["预算"]},
+    {"name": "funding_expense",            "kind": "agg",  "entities": ["经费", "资金"], "verbs": ["支出"]},
+    {"name": "funding_balance",            "kind": "agg",  "entities": ["经费", "资金"], "verbs": ["结余"]},
+    {"name": "funding_by_type",            "kind": "agg",  "entities": ["经费", "资金"], "verbs": ["分布", "类型"]},
+    {"name": "achievement_count_by_status", "kind": "agg", "entities": ["成果", "专利", "论文"], "verbs": ["数量", "状态"]},
+    {"name": "achievement_count_by_category", "kind": "agg", "entities": ["成果"], "verbs": ["类型", "分布"]},
+    {"name": "achievement_count_total",    "kind": "agg",  "entities": ["成果", "专利", "论文", "软著", "软件著作权", "鉴定报告"], "verbs": ["总数", "共计", "总共", "多少", "几个", "几项", "几件", "几篇"]},
+    {"name": "achievement_authorized_count", "kind": "agg", "entities": ["成果", "专利"], "verbs": ["已授权"]},
+    {"name": "achievement_authorized",     "kind": "list", "entities": ["成果", "专利"], "verbs": ["已授权"]},
+    {"name": "achievement_list",           "kind": "list", "entities": ["成果", "专利", "论文", "软著", "软件著作权", "鉴定报告"], "verbs": ["有哪些", "哪些", "清单", "列表", "列出", "都有"]},
+    {"name": "todo_unhandled_count",       "kind": "agg",  "entities": ["待办"], "verbs": ["未处理", "数量"]},
+    {"name": "todo_recent",                "kind": "list", "entities": ["待办"], "verbs": ["最近"]},
+]
+
+STAT_NOTE_MAP = {
+    "contract_count_total": "合同总数 = 合同台账全量记录数（含未确认）",
+    "contract_amount_total": "合同总金额 = 含税金额优先求和，无含税退回合同金额（与项目看板口径一致）",
+    "contract_count_by_type": "按合同类型分组计数，未分类归「未分类」",
+    "contract_count_by_status": "按到期日状态分组：已超期/即将到期/正常/未识别",
+    "funding_income": "到账经费 = 类型为「到账」的金额求和",
+    "funding_budget": "预算经费 = 类型为「预算」的金额求和",
+    "funding_expense": "支出经费 = 类型为「支出」的金额求和",
+    "funding_balance": "经费结余 = 到账金额 − 支出金额",
+    "funding_by_type": "按经费类型（预算/到账/支出）分组求和",
+    "achievement_count_by_status": "按成果状态分组计数（含未关联项目的成果）",
+    "achievement_count_by_category": "按成果类型分组计数（含未关联项目的成果）",
+    "achievement_count_total": "成果总数 = 成果台账全量记录数（含未关联项目的成果）",
+    "achievement_authorized_count": "已授权成果数 = 状态为「已授权」的成果计数（含未关联项目的成果）",
+    "achievement_authorized": "已授权成果明细（按取得日期倒序，含未关联项目的成果）",
+    "achievement_list": "成果明细（按取得日期倒序，含未关联项目的成果）",
+    "todo_unhandled_count": "未处理待办数 = 状态为「未处理」的待办计数",
+    "todo_recent": "最近待办明细（按创建时间倒序，最多 10 条）",
+}
+
+
+def _is_stat_question(q: str) -> bool:
+    """规则判定是否统计意图（零成本，不再为路由额外调用 LLM）。"""
+    return any(v in q for v in STAT_VERBS)
+
+
+def _detect_stat_queries(q: str) -> list:
+    """返回命中的统计查询名列表（可一次命中多个）。"""
+    names = []
+    for sq in STAT_QUERIES:
+        if not any(e in q for e in sq["entities"]):
+            continue
+        verbs = sq.get("verbs")
+        if verbs and not any(v in q for v in verbs):
+            continue
+        names.append(sq["name"])
+    # 优先级去重：命中「已授权」这类带状态过滤的查询后，去掉泛化的「全部成果」计数/明细，避免口径冲突
+    if "achievement_authorized" in names:
+        for _drop in ("achievement_list", "achievement_count_total"):
+            if _drop in names:
+                names.remove(_drop)
+    # 命中「成果明细列表」时补一个精确总数，让 LLM 能报出「共 N 项」而非靠数明细
+    if "achievement_list" in names and "achievement_count_total" not in names:
+        names.append("achievement_count_total")
+    return names
+
+
+ACHIEVEMENT_CATEGORY_WORDS = [
+    ("软件著作权", "软件著作权"),
+    ("鉴定报告", "鉴定报告"),
+    ("成果登记", "成果登记"),
+    ("软著", "软件著作权"),
+    ("专利", "专利"),
+    ("论文", "论文"),
+    ("获奖", "获奖"),
+    ("标准", "标准"),
+]
+
+
+def _detect_achievement_category(q: str) -> Optional[str]:
+    """从问句中识别成果类型（专利/论文/软著/鉴定报告…），无明确类型返回 None。"""
+    if not q:
+        return None
+    for word, cat in ACHIEVEMENT_CATEGORY_WORDS:
+        if word in q:
+            return cat
+    return None
+
+
+def _run_stat_queries(names: list, project_id: Optional[int], db: Session, question: Optional[str] = None) -> dict:
+    """执行聚合类统计查询（agg），返回 {查询名: 数值或分组字典}。"""
+    results = {}
+    ach_cat = _detect_achievement_category(question)
+
+    if "contract_count_total" in names:
+        q = db.query(func.count(Contract.id))
+        if project_id is not None:
+            q = q.filter(Contract.project_id == project_id)
+        results["contract_count_total"] = int(q.scalar() or 0)
+
+    if "contract_amount_total" in names:
+        amount_expr = func.coalesce(func.nullif(Contract.amount_incl_tax, 0), Contract.amount_value, 0)
+        q = db.query(func.sum(amount_expr))
+        if project_id is not None:
+            q = q.filter(Contract.project_id == project_id)
+        results["contract_amount_total"] = round(float(q.scalar() or 0), 2)
+
+    if "contract_count_by_type" in names:
+        q = db.query(Contract.contract_type, func.count(Contract.id))
+        if project_id is not None:
+            q = q.filter(Contract.project_id == project_id)
+        dist = {}
+        for ctype, cnt in q.group_by(Contract.contract_type).all():
+            dist[ctype or "未分类"] = int(cnt)
+        results["contract_count_by_type"] = dist
+
+    if "contract_count_by_status" in names:
+        q = db.query(Contract)
+        if project_id is not None:
+            q = q.filter(Contract.project_id == project_id)
+        dist = {}
+        for c in q.all():
+            status, _ = _contract_status(c.due_date)
+            dist[status] = dist.get(status, 0) + 1
+        results["contract_count_by_status"] = dist
+
+    if "funding_income" in names:
+        q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "到账")
+        if project_id is not None:
+            q = q.filter(Funding.project_id == project_id)
+        results["funding_income"] = round(float(q.scalar() or 0), 2)
+
+    if "funding_budget" in names:
+        q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "预算")
+        if project_id is not None:
+            q = q.filter(Funding.project_id == project_id)
+        results["funding_budget"] = round(float(q.scalar() or 0), 2)
+
+    if "funding_expense" in names:
+        q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "支出")
+        if project_id is not None:
+            q = q.filter(Funding.project_id == project_id)
+        results["funding_expense"] = round(float(q.scalar() or 0), 2)
+
+    if "funding_balance" in names:
+        inc = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "到账")
+        exp = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "支出")
+        if project_id is not None:
+            inc = inc.filter(Funding.project_id == project_id)
+            exp = exp.filter(Funding.project_id == project_id)
+        income = float(inc.scalar() or 0)
+        expense = float(exp.scalar() or 0)
+        results["funding_balance"] = round(income - expense, 2)
+
+    if "funding_by_type" in names:
+        q = db.query(Funding.fund_type, func.sum(Funding.amount))
+        if project_id is not None:
+            q = q.filter(Funding.project_id == project_id)
+        dist = {}
+        for ft, amt in q.group_by(Funding.fund_type).all():
+            dist[ft or "其他"] = round(float(amt or 0), 2)
+        results["funding_by_type"] = dist
+
+    if "achievement_count_by_status" in names:
+        q = db.query(Achievement.status, func.count(Achievement.id))
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        if ach_cat:
+            q = q.filter(Achievement.category == ach_cat)
+        dist = {}
+        for st, cnt in q.group_by(Achievement.status).all():
+            dist[st or "其他"] = int(cnt)
+        results["achievement_count_by_status"] = dist
+
+    if "achievement_count_by_category" in names:
+        q = db.query(Achievement.category, func.count(Achievement.id))
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        dist = {}
+        for cat, cnt in q.group_by(Achievement.category).all():
+            dist[cat or "其他"] = int(cnt)
+        results["achievement_count_by_category"] = dist
+
+    if "achievement_count_total" in names:
+        q = db.query(func.count(Achievement.id))
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        if ach_cat:
+            q = q.filter(Achievement.category == ach_cat)
+        results["achievement_count_total"] = int(q.scalar() or 0)
+
+    if "achievement_authorized_count" in names:
+        q = db.query(func.count(Achievement.id)).filter(Achievement.status == "已授权")
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        if ach_cat:
+            q = q.filter(Achievement.category == ach_cat)
+        results["achievement_authorized_count"] = int(q.scalar() or 0)
+
+    if "todo_unhandled_count" in names:
+        todos = db.query(Todo).filter(Todo.status == "未处理").all()
+        if project_id is not None:
+            tpm = _todo_project_map(db)
+            todos = [t for t in todos if tpm.get((t.category, t.source_id)) == project_id]
+        results["todo_unhandled_count"] = len(todos)
+
+    return results
+
+
+def _run_list_queries(names: list, project_id: Optional[int], db: Session, question: Optional[str] = None) -> list:
+    """执行明细类统计查询（list），返回 card 列表（可 merge 进检索结果）。"""
+    cards = []
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    ach_cat = _detect_achievement_category(question)
+
+    if "achievement_authorized" in names:
+        q = db.query(Achievement).filter(Achievement.status == "已授权")
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        if ach_cat:
+            q = q.filter(Achievement.category == ach_cat)
+        for a in q.order_by(Achievement.achieve_date.desc()).all():
+            card = _achievement_to_card(a, pmap.get(a.project_id, ""))
+            card["score"] = 0.0
+            cards.append(card)
+
+    if "achievement_list" in names:
+        q = db.query(Achievement)
+        if project_id is not None:
+            q = q.filter(Achievement.project_id == project_id)
+        if ach_cat:
+            q = q.filter(Achievement.category == ach_cat)
+        for a in q.order_by(Achievement.achieve_date.desc()).all():
+            card = _achievement_to_card(a, pmap.get(a.project_id, ""))
+            card["score"] = 0.0
+            cards.append(card)
+
+    if "todo_recent" in names:
+        tpm = _todo_project_map(db) if project_id is not None else None
+        out = []
+        for t in db.query(Todo).order_by(Todo.created_at.desc()).all():
+            pid = tpm.get((t.category, t.source_id)) if tpm else None
+            if project_id is not None and pid != project_id:
+                continue
+            out.append((t, pid))
+            if len(out) >= 10:
+                break
+        for t, pid in out:
+            card = _todo_to_card(t, pmap.get(pid, "") if pid else "", pid)
+            card["score"] = 0.0
+            cards.append(card)
+
+    return cards
+
+
+def _build_stat_note(names: list) -> str:
+    """生成统计口径文案。"""
+    notes = [STAT_NOTE_MAP[n] for n in names if n in STAT_NOTE_MAP]
+    return "；".join(notes)
+
+
+def _build_empty_answer(sources: Optional[List[str]] = None) -> str:
+    """无命中时的差异化兜底文案。"""
+    src_labels = {
+        "file": "资料",
+        "contract": "合同",
+        "funding": "经费",
+        "achievement": "成果",
+        "todo": "待办",
+        "project": "项目",
+        "document_summary": "资料摘要",
+    }
+    if sources:
+        valid = [s for s in sources if s in src_labels]
+        if len(valid) == 1:
+            label = src_labels[valid[0]]
+            return f"{label}模块暂无数据或没有找到相关内容。请先录入/上传相关数据，或尝试更换关键词。"
+    return "资料中没有找到相关内容。请尝试更换关键词，或先上传相关文档。"
 
 
 app = FastAPI(
@@ -235,6 +982,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = 5
     project_id: Optional[int] = None   # 新增：None 表示搜全部项目
+    sources: Optional[List[str]] = None   # 问答范围；None/[] 表示全部，元素∈QA_SOURCES，非法值忽略并落到「全部」
 
 
 class CrossProjectRequest(BaseModel):
@@ -679,21 +1427,73 @@ def search_files(q: str, db: Session = Depends(get_db)):
 # ============ 健康检查 ============
 # ============ 智能问答接口 ============
 @app.post("/ask", summary="智能问答")
-def ask_question(req: AskRequest):
-    """基于知识库内容的智能问答（RAG）：分块检索 + 单次综合回答。
-    通过分块把大文件的任意相关段落都纳入，避免旧版只读文件开头导致回答不全面。"""
+def ask_question(req: AskRequest, db: Session = Depends(get_db)):
+    """基于知识库内容的智能问答（RAG）：多源混合检索 + 统计意图路由 + 单次综合回答。
+    统计类问题由数据库精确计算；查找类问题按多源配额装配知识片段；两种场景均单次调用 DeepSeek 生成回答。"""
     question = (req.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    chunks, references = _retrieve_context(question, req.top_k, project_id=req.project_id)
-    if not chunks:
+    sources = [s for s in (req.sources or []) if s in QA_SOURCES]
+
+    # 1) 统计意图：规则判定 + 预定义聚合/明细查询（零额外 LLM 调用）
+    stat_context = ""
+    stat_note = ""
+    list_cards = []
+    if _is_stat_question(question):
+        names = _detect_stat_queries(question)
+        if names:
+            agg_names = [n for n in names if any(q["name"] == n and q["kind"] == "agg" for q in STAT_QUERIES)]
+            list_names = [n for n in names if any(q["name"] == n and q["kind"] == "list" for q in STAT_QUERIES)]
+            agg_results = _run_stat_queries(agg_names, req.project_id, db, question)
+            if agg_results:
+                stat_context = "【精确统计结果】\n" + json.dumps(agg_results, ensure_ascii=False)
+                stat_note = _build_stat_note(agg_names)
+            list_cards = _run_list_queries(list_names, req.project_id, db, question)
+
+    # 2) 多源检索（统计类仍跑检索以提供明细/溯源）
+    chunks, references = _retrieve_context(question, req.top_k, project_id=req.project_id, sources=sources)
+
+    # 3) 明细查询结果 merge：references 去重后全量保留；上下文明细优先、限量，检索块作为补充，总块数封顶
+    ref_keys = set((r.get("source_type"), r.get("source_id")) for r in references)
+    for card in list_cards:
+        key = (card["source_type"], card["source_id"])
+        if key not in ref_keys:
+            references.append(card["ref"])
+            ref_keys.add(key)
+
+    seen_keys = set((c["source_type"], c.get("source_id")) for c in chunks)
+    detail_chunks = []
+    for card in list_cards:
+        key = (card["source_type"], card["source_id"])
+        if key in seen_keys:
+            continue
+        if len(detail_chunks) >= LIST_CONTEXT_CAP:
+            break
+        detail_chunks.append({
+            "source_type": card["source_type"],
+            "label": card["label"],
+            "text": card["text"],
+            "snippet": card["ref"].get("snippet", ""),
+            "project_id": card["project_id"],
+            "project_name": card["project_name"],
+        })
+        seen_keys.add(key)
+    chunks = detail_chunks + chunks
+    if len(chunks) > MAX_CHUNKS:
+        chunks = chunks[:MAX_CHUNKS]
+
+    if not chunks and not stat_context:
         return {
-            "answer": "资料中没有找到相关内容。请尝试更换关键词，或先上传相关文档。",
+            "answer": _build_empty_answer(sources),
             "references": [],
+            "stat_note": stat_note,
         }
 
-    context = "\n\n".join(f"【{c['label']}】\n{c['text']}" for c in chunks)
+    context = ""
+    if stat_context:
+        context += stat_context + "\n\n---\n\n"
+    context += "\n\n".join(f"【{c['label']}】\n{c['text']}" for c in chunks)
     logger.info(f"[问答] 命中 {len(chunks)} 个相关片段 / 共 {len(context)} 字，开始生成回答")
     try:
         answer = _call_deepseek(question, context)
@@ -701,7 +1501,7 @@ def ask_question(req: AskRequest):
         print(f"[问答] 调用 DeepSeek 失败：{e}")
         raise HTTPException(status_code=500, detail=f"调用 DeepSeek 失败：{e}")
 
-    return {"answer": answer, "references": references}
+    return {"answer": answer, "references": references, "stat_note": stat_note}
 @app.get("/", summary="健康检查")
 def health_check():
     return {"status": "ok", "message": "研发知识智能管理平台运行中"}
@@ -4298,27 +5098,67 @@ def _normalize_dup_key(filename: str) -> str:
     return s.lower()
 
 
-@app.get("/achievements/duplicates", summary="查重：扫描成果台账中的重复记录（只读，不删除）")
-def achievement_duplicates(db: Session = Depends(get_db)):
-    """按「文件名归一化」把成果分组，同一 key 出现多次即为重复；每组最新一条为保留项。"""
-    items = db.query(Achievement).all()
-    pmap = {p.id: p.name for p in db.query(Project).all()}
-    groups: dict = {}
-    for a in items:
-        key = _normalize_dup_key(a.file_name)
-        if not key:
-            continue  # 手动登记（无文件）不参与文件名查重
-        groups.setdefault(key, []).append(a)
+def _normalize_name_key(name: str) -> str:
+    """成果名称归一化，用于同名查重：去首尾/内部空白、统一小写。"""
+    if not name:
+        return ""
+    s = str(name).strip()
+    s = re.sub(r"\s+", "", s)
+    return s.lower()
 
-    result = []
-    for key, lst in groups.items():
+
+def _achievement_dup_info(a) -> tuple:
+    """返回成果查重的 (group_key, display_name)。
+
+    判重优先级：先按「成果名称」归一化查重，名称缺失时回退「文件名」归一化。
+    group_key 三元组为 (base, project_id_or_0, source_file_id_or_0)，用于把「同名」
+    记录进一步按项目与来源文件区分，避免把以下「同名但非重复」的记录误判为重复：
+      - 不同项目下的同名成果（如各项目各自的「科技查新报告」）；
+      - 同一项目内从不同文件管理文件同步而来的同名记录（source_file_id 不同）。
+    base 为空表示不参与查重（既无名称也无文件名）。
+    """
+    display = a.name or a.file_name or ""
+    base = _normalize_name_key(a.name)
+    if not base:
+        base = _normalize_dup_key(a.file_name)
+    if not base:
+        return (None, display)
+    pid = a.project_id if a.project_id is not None else 0
+    sfid = a.source_file_id if a.source_file_id is not None else 0
+    return ((base, pid, sfid), display)
+
+
+def _group_achievement_duplicates(items) -> list:
+    """按查重键把成果分组，返回重复组列表 [(group_key, display_name, [Achievement, ...])]，仅含 >=2 条的组。"""
+    groups: dict = {}
+    names: dict = {}
+    for a in items:
+        gkey, disp = _achievement_dup_info(a)
+        if gkey is None:
+            continue
+        groups.setdefault(gkey, []).append(a)
+        names.setdefault(gkey, disp)
+    out = []
+    for gkey, lst in groups.items():
         if len(lst) < 2:
             continue
+        out.append((gkey, names.get(gkey, gkey[0]), lst))
+    return out
+
+
+@app.get("/achievements/duplicates", summary="查重：扫描成果台账中的重复记录（只读，不删除）")
+def achievement_duplicates(db: Session = Depends(get_db)):
+    """按「成果名称（优先）/文件名归一化 + 项目 + 来源文件」把成果分组，同一 key 出现多次即为重复；每组最新一条为保留项。"""
+    items = db.query(Achievement).all()
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+
+    result = []
+    for gkey, disp, lst in _group_achievement_duplicates(items):
         lst_sorted = sorted(lst, key=lambda x: (x.created_at or datetime.min, x.id))
         keep = lst_sorted[-1]
         remove = lst_sorted[:-1]
         result.append({
-            "key": key,
+            "key": disp,
             "count": len(lst),
             "keep": _achievement_to_dict(keep, pmap.get(keep.project_id, "")),
             "remove": [_achievement_to_dict(x, pmap.get(x.project_id, "")) for x in remove],
@@ -4334,18 +5174,10 @@ def achievement_duplicates(db: Session = Depends(get_db)):
 @app.post("/achievements/deduplicate", summary="去重：每组重复成果只保留最新一条，其余删除")
 def achievement_deduplicate(db: Session = Depends(get_db)):
     items = db.query(Achievement).all()
-    groups: dict = {}
-    for a in items:
-        key = _normalize_dup_key(a.file_name)
-        if not key:
-            continue
-        groups.setdefault(key, []).append(a)
 
     deleted_ids = []
     deleted_names = []
-    for key, lst in groups.items():
-        if len(lst) < 2:
-            continue
+    for gkey, disp, lst in _group_achievement_duplicates(items):
         lst_sorted = sorted(lst, key=lambda x: (x.created_at or datetime.min, x.id))
         for x in lst_sorted[:-1]:
             # 仅独立上传的成果（非文件管理同步）删除时才删磁盘文件

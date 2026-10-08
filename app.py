@@ -29,6 +29,27 @@ requests.delete = _session.delete
 API_BASE = "http://127.0.0.1:8000"
 CHAT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
 
+# 问答范围选项（label → 后端 source_type，镜像 main.py 的 QA_SOURCES，不跨端 import）
+QA_SOURCE_OPTIONS = {
+    "📚 资料": "file",
+    "📄 合同": "contract",
+    "💰 经费": "funding",
+    "🏆 成果": "achievement",
+    "✅ 待办": "todo",
+    "📁 项目信息": "project",
+}
+
+# 引用来源图标（source_type → emoji）
+ICON = {
+    "file": "📄",
+    "document_summary": "📄",
+    "contract": "📄",
+    "funding": "💰",
+    "achievement": "🏆",
+    "todo": "✅",
+    "project": "📁",
+}
+
 st.set_page_config(
     page_title="研发知识智能管理平台",
     page_icon="📚",
@@ -1068,13 +1089,16 @@ def api_documents_summarize(project_id, question):
         return None
 
 
-def api_ask(question, top_k=5, project_id=None):
-    """调用后端 /ask 智能问答接口（深度回答可能较慢，超时放宽到 300s）"""
+def api_ask(question, top_k=40, project_id=None, sources=None):
+    """调用后端 /ask 智能问答接口（回答较长时会自动续写，超时放宽到 600s）"""
     try:
+        payload = {"question": question, "top_k": top_k, "project_id": project_id}
+        if sources:
+            payload["sources"] = sources
         resp = requests.post(
             f"{API_BASE}/ask",
-            json={"question": question, "top_k": top_k, "project_id": project_id},
-            timeout=300,
+            json=payload,
+            timeout=600,
         )
         return resp
     except Exception as e:
@@ -1098,22 +1122,32 @@ def api_cross_project(question):
 
 def render_ask_page():
     st.header("🤖 智能问答")
-    st.caption("基于知识库内容提问，由 DeepSeek 生成答案（仅依据已上传的文档资料）")
+    st.caption("基于知识库内容提问，由 DeepSeek 生成答案（依据文档资料与合同/经费/成果/待办等结构化台账）")
 
     # 启动时从本地文件读取历史，避免刷新/重开后丢失
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = _load_chat_history()
 
-    # ---- 新增：选择要提问的项目 ----
+    # ---- 选择要提问的项目 ----
     projects = api_list_projects()
     project_options = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in projects}
     option_names = ["🌐 全部项目"] + list(project_options.keys())
     selected = st.selectbox(
         "选择要提问的项目",
         option_names,
-        help="选择后，问答只会在该项目的文件里查找资料",
+        help="选择后，问答只会在该项目的数据里查找",
     )
     selected_project_id = None if selected == "🌐 全部项目" else project_options[selected]
+
+    # ---- 问答范围多选 + 智能自动判断开关 ----
+    selected_labels = st.multiselect(
+        "问答范围",
+        list(QA_SOURCE_OPTIONS.keys()),
+        default=list(QA_SOURCE_OPTIONS.keys()),
+        help="选择要检索的数据源；开启「智能自动判断范围」时忽略此选择，由后端检索全部数据源",
+    )
+    auto_scope = st.toggle("智能自动判断范围", value=True)
+    sources = None if auto_scope else [QA_SOURCE_OPTIONS[l] for l in selected_labels]
 
     question = st.text_input("请输入你的问题：", key="ask_input")
 
@@ -1133,17 +1167,8 @@ def render_ask_page():
         if not q:
             st.warning("请先输入问题")
         else:
-            STATS_WORDS = ["统计", "汇总", "一共", "总共", "合计", "总计", "多少份", "多少笔", "有哪些", "分布", "平均"]
-            DOC_WORDS = ["总结", "概览", "梳理", "归纳", "资料", "方案", "报告", "纪要", "文档"]
-            is_doc = selected_project_id is not None and any(w in q for w in DOC_WORDS)
-            is_stats = selected_project_id is not None and any(w in q for w in STATS_WORDS)
             with st.spinner("正在检索资料并生成答案，请稍候……"):
-                if is_doc:
-                    resp = api_documents_summarize(selected_project_id, q)
-                elif is_stats:
-                    resp = api_project_stats(selected_project_id, q)
-                else:
-                    resp = api_ask(q, top_k=1100, project_id=selected_project_id)
+                resp = api_ask(q, top_k=40, project_id=selected_project_id, sources=sources)
 
             if resp is None:
                 pass  # 错误已在 api_ask 中提示
@@ -1153,34 +1178,43 @@ def render_ask_page():
                 data = resp.json()
                 answer = data.get("answer", "")
                 references = data.get("references", [])
+                stat_note = data.get("stat_note", "")
                 st.session_state.chat_history.append({
                     "question": q,
                     "answer": answer,
                     "references": references,
+                    "stat_note": stat_note,
                 })
                 _save_chat_history(st.session_state.chat_history)
 
     # 显示聊天历史（最新在前，不用往下滚动）
     if not st.session_state.chat_history:
         st.info("还没有提问记录，试试问一个知识库里已有的问题吧。")
-    for item in reversed(st.session_state.chat_history):
+    for h_idx, item in enumerate(reversed(st.session_state.chat_history)):
         st.markdown(f"**🙋 你：** {item['question']}")
         st.markdown(f"**🤖 AI：** {item['answer']}")
+        if item.get("stat_note"):
+            st.caption(f"📐 统计口径：{item['stat_note']}")
         if item.get("references"):
             st.markdown("**📎 参考资料：**")
-            for ref in item["references"]:
-                fname = ref.get("original_name", "未命名")
-                pname = ref.get("project_name", "")
-                cat = ref.get("category", "") or "其他"
-                dtype = ref.get("doc_type", "") or ""
-                stage = ref.get("stage", "") or ""
-                tags = " ｜ ".join(t for t in [cat, dtype, stage] if t)
+            for r_idx, ref in enumerate(item["references"]):
+                stype = ref.get("source_type", "file")
+                label = ref.get("label") or ref.get("original_name", "未命名")
                 dl = ref.get("download_url", "")
-                line = f"- 📄 **{fname}**（{pname}）" + (f" ｜ {tags}" if tags else "")
-                if dl:
-                    tok = st.session_state.get("token", "")
-                    line += f"　[⬇️ 下载]({API_BASE}{dl}?token={tok})"
-                st.markdown(line)
+                jump = ref.get("jump_url", "")
+                pid = ref.get("project_id")
+                st.markdown(f"- {ICON.get(stype, '📄')} **{label}**")
+                _c_dl, _c_jump, _c_spacer = st.columns([1, 1, 6])
+                with _c_dl:
+                    if stype in ("contract", "achievement", "file", "document_summary") and dl:
+                        tok = st.session_state.get("token", "")
+                        st.markdown(f"[⬇️ 下载]({API_BASE}{dl}?token={tok})")
+                with _c_jump:
+                    if jump:
+                        target_menu = _todo_label if stype == "todo" else jump
+                        if st.button("🔗 查看", key=f"qa_jump_{h_idx}_{r_idx}"):
+                            st.session_state["_nav_target"] = (target_menu, pid)
+                            st.rerun()
                 if ref.get("snippet"):
                     st.caption(f"　　片段：{ref['snippet']}")
         st.divider()
@@ -2898,8 +2932,64 @@ elif menu == "🏆 成果台账":
         import pandas as pd
         src_map = {"auto": "🤖 自动识别", "manual": "✍️ 手动登记", "file": "📁 文件同步"}
         proc_map = {"done": "✅ 已完成", "processing": "⏳ 识别中", "error": "⚠️ 识别异常"}
-        rows = []
+
+        # —— 筛选栏：按关键词 / 类型 / 状态 / 项目 / 取得日期 搜索与筛选 ——
+        with st.container(border=True):
+            st.markdown("**🔍 搜索与筛选**")
+            f1, f2 = st.columns([2, 1])
+            with f1:
+                kw = st.text_input("🔍 关键词搜索", placeholder="成果名称 / 权利人 / 备注 / 关联文件", key="ach_filter_kw")
+            with f2:
+                fd1, fd2 = st.columns(2)
+                with fd1:
+                    date_from = st.text_input("取得日期（起）", placeholder="如 2026-01-01", key="ach_filter_date_from")
+                with fd2:
+                    date_to = st.text_input("取得日期（止）", placeholder="如 2026-12-31", key="ach_filter_date_to")
+            f3, f4, f5 = st.columns(3)
+            with f3:
+                f_cats = st.multiselect("类型", cats, default=[], key="ach_filter_cats")
+            with f4:
+                f_statuses = st.multiselect("状态", statuses, default=[], key="ach_filter_statuses")
+            with f5:
+                f_proj = st.selectbox("所属项目", ["全部项目"] + list(project_options.keys()), key="ach_filter_proj")
+            if st.button("🔄 重置", key="ach_filter_reset"):
+                for k in ("ach_filter_kw", "ach_filter_date_from", "ach_filter_date_to",
+                          "ach_filter_cats", "ach_filter_statuses", "ach_filter_proj"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        # 前端过滤（数据量小，直接 Python 过滤；仅作用于「成果明细」表格展示）
+        kw_l = (kw or "").strip().lower()
+        date_from_s = (date_from or "").strip()
+        date_to_s = (date_to or "").strip()
+        filtered = []
         for a in items:
+            if kw_l:
+                hay = " ".join([
+                    a.get("name") or "",
+                    a.get("holder") or "",
+                    a.get("remark") or "",
+                    a.get("file_name") or "",
+                ]).lower()
+                if kw_l not in hay:
+                    continue
+            if f_cats and (a.get("category") or "") not in f_cats:
+                continue
+            if f_statuses and (a.get("status") or "") not in f_statuses:
+                continue
+            if f_proj != "全部项目" and (a.get("project_id") or None) != project_options[f_proj]:
+                continue
+            d = a.get("achieve_date") or ""
+            if date_from_s and d < date_from_s:
+                continue
+            if date_to_s and d > date_to_s:
+                continue
+            filtered.append(a)
+
+        st.caption(f"筛选结果 {len(filtered)} / 共 {len(items)} 条")
+
+        rows = []
+        for a in filtered:
             rows.append({
                 "ID": a["id"],
                 "项目": a.get("project_name") or "平台级",
@@ -2972,41 +3062,41 @@ elif menu == "🏆 成果台账":
 
         st.divider()
 
-        st.subheader("🗑️ 删除成果（框选批量）")
-        st.caption("勾选要删除的成果，可一次删除多个；删除不可恢复，请谨慎操作")
-        tb1, tb2 = st.columns(2)
-        with tb1:
-            if st.button("☑️ 全选", key="ach_sel_all", use_container_width=True):
-                for a in items:
-                    st.session_state[f"ach_sel_{a['id']}"] = True
-                st.rerun()
-        with tb2:
-            if st.button("⬜ 清空选择", key="ach_sel_none", use_container_width=True):
-                for a in items:
-                    st.session_state[f"ach_sel_{a['id']}"] = False
-                st.rerun()
-        for a in items:
-            src_label = src_map.get(a.get("source"), a.get("source") or "手动")
-            st.checkbox(f"#{a['id']}｜{a['name'] or '（待识别）'}｜{a.get('category') or '未知类型'}｜{src_label}", key=f"ach_sel_{a['id']}")
-        selected_ids = [a["id"] for a in items if st.session_state.get(f"ach_sel_{a['id']}", False)]
-        st.markdown(f"已选 **{len(selected_ids)}** 项")
-        confirm = st.checkbox("我确认删除以上勾选的成果（不可恢复）", key="ach_batch_del_confirm")
-        if st.button(f"⚠️ 一键删除所选（{len(selected_ids)}）", key="ach_batch_del_btn", disabled=(not selected_ids or not confirm)):
-            r = api_batch_delete_achievements(selected_ids)
-            if r and r.status_code == 200:
-                d = r.json()
-                st.success(f"已删除 {d.get('count', 0)} 条成果")
-                for a in items:
-                    st.session_state.pop(f"ach_sel_{a['id']}", None)
-                st.rerun()
-            else:
-                st.error("删除失败")
+        with st.expander("🗑️ 删除成果（框选批量）", expanded=False):
+            st.caption("勾选要删除的成果，可一次删除多个；删除不可恢复，请谨慎操作")
+            tb1, tb2 = st.columns(2)
+            with tb1:
+                if st.button("☑️ 全选", key="ach_sel_all", use_container_width=True):
+                    for a in items:
+                        st.session_state[f"ach_sel_{a['id']}"] = True
+                    st.rerun()
+            with tb2:
+                if st.button("⬜ 清空选择", key="ach_sel_none", use_container_width=True):
+                    for a in items:
+                        st.session_state[f"ach_sel_{a['id']}"] = False
+                    st.rerun()
+            for a in items:
+                src_label = src_map.get(a.get("source"), a.get("source") or "手动")
+                st.checkbox(f"#{a['id']}｜{a['name'] or '（待识别）'}｜{a.get('category') or '未知类型'}｜{src_label}", key=f"ach_sel_{a['id']}")
+            selected_ids = [a["id"] for a in items if st.session_state.get(f"ach_sel_{a['id']}", False)]
+            st.markdown(f"已选 **{len(selected_ids)}** 项")
+            confirm = st.checkbox("我确认删除以上勾选的成果（不可恢复）", key="ach_batch_del_confirm")
+            if st.button(f"⚠️ 一键删除所选（{len(selected_ids)}）", key="ach_batch_del_btn", disabled=(not selected_ids or not confirm)):
+                r = api_batch_delete_achievements(selected_ids)
+                if r and r.status_code == 200:
+                    d = r.json()
+                    st.success(f"已删除 {d.get('count', 0)} 条成果")
+                    for a in items:
+                        st.session_state.pop(f"ach_sel_{a['id']}", None)
+                    st.rerun()
+                else:
+                    st.error("删除失败")
 
     st.divider()
 
     # —— 查重去重 ——
     st.subheader("🔍 查重去重")
-    st.caption("按「文件名（去扩展名 / OCR 等冗余标记）」识别重复成果，每组只保留最新一条")
+    st.caption("按「成果名称（优先）＋ 项目 ＋ 来源文件」识别重复成果；同名但分属不同项目/文件的记录不会误删，每组只保留最新一条")
     if st.button("🔍 扫描重复成果", key="ach_dup_scan"):
         dup = api_achievement_duplicates()
         if dup is None:
