@@ -180,6 +180,109 @@ def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] =
         db.close()
 
 
+def _retrieve_achievement_context(question: str, top_k: int = 5, project_id: Optional[int] = None):
+    """成果台账检索：检索成果的结构化字段（名称/类型/状态/权利人/申请日期/取得日期/备注）。
+    成果是平台级知识资产，跨项目共享，因此不按 project_id 过滤——未关联项目（project_id 为空）
+    的成果（如大量专利）同样参与检索并标注「平台级」。
+    说明：仅检索结构化元数据（毫秒级、无 OCR）。证书全文检索需缓存/索引避免每次问答全量 OCR，留待后续。"""
+    question = (question or "").strip()
+    if not question:
+        return [], []
+
+    keywords = []
+    try:
+        keywords = _expand_query(question)
+    except Exception as e:
+        logger.warning(f"[成果检索] 关键词扩展失败，退回拆词：{e}")
+    if not keywords:
+        keywords = _fallback_terms(question)
+    kw_lower = [k.lower() for k in keywords if k]
+
+    max_chunks = MAX_CHUNKS
+    if top_k and top_k > 0:
+        max_chunks = max(1, min(top_k, MAX_CHUNKS))
+
+    db = SessionLocal()
+    try:
+        rows = db.query(Achievement).all()
+        pmap = {p.id: p.name for p in db.query(Project).all()}
+
+        q_low = question.lower()
+        scored = []  # (score, achievement, meta_text, snippet)
+        for a in rows:
+            meta_parts = []
+            for label, val in [
+                ("成果名称", a.name), ("类型", a.category), ("状态", a.status),
+                ("权利人", a.holder), ("申请日期", a.application_date),
+                ("取得日期", a.achieve_date), ("备注", a.remark),
+            ]:
+                if val:
+                    meta_parts.append(f"{label}：{val}")
+            meta_text = "；".join(meta_parts)
+            if not meta_text.strip():
+                continue
+
+            name_low = (a.name or "").strip().lower()
+
+            # 名称精确/包含匹配：成果名与问题互为子串时大幅加成（最精确的锚点，
+            # 避免通用词「专利/申请/日期」让所有专利同分而淹没真正命中的那条）
+            exact_bonus = 0.0
+            if name_low and (name_low in q_low or q_low in name_low):
+                exact_bonus += 100.0
+
+            meta_low = meta_text.lower()
+            score = 0.0
+            snippet = ""
+            for k in kw_lower:
+                cnt = meta_low.count(k)
+                if cnt > 0:
+                    score += cnt * max(1.0, len(k) / 2)
+                    if not snippet:
+                        snippet = _make_snippet(meta_text, k)
+            # 成果名关键词命中加成（名称是重要检索锚点）
+            name_bonus = sum(max(1, len(k) // 2) for k in kw_lower if k in name_low) * 3
+
+            if score <= 0 and exact_bonus <= 0:
+                continue
+            scored.append((score + name_bonus + exact_bonus, a, meta_text, snippet))
+
+        if not scored:
+            return [], []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = scored[:max_chunks]
+
+        chunks_out = []
+        ref_map = {}
+        for score, a, text, snippet in chosen:
+            pname = pmap.get(a.project_id, "") if a.project_id else ""
+            scope = pname if pname else "平台级（未关联项目）"
+            disp_name = a.name or a.file_name or "成果"
+            chunks_out.append({
+                "label": f"{disp_name}（{scope}，成果台账）",
+                "text": text,
+                "file_id": f"ach-{a.id}",
+                "original_name": disp_name,
+                "snippet": snippet,
+            })
+            ref_map.setdefault(a.id, {
+                "file_id": f"ach-{a.id}",
+                "original_name": disp_name,
+                "project_id": a.project_id,
+                "project_name": pname,
+                "project_code": "",
+                "category": a.category or "其他",
+                "doc_type": "成果",
+                "stage": "",
+                "download_url": f"/achievements/{a.id}/download" if a.file_path else "",
+                "snippet": snippet,
+            })
+
+        return chunks_out, list(ref_map.values())
+    finally:
+        db.close()
+
+
 app = FastAPI(
     title="研发知识智能管理平台",
     description="MVP 第一版：项目管理 + 文件管理 + 内容解析",
@@ -690,7 +793,14 @@ def ask_question(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    chunks, references = _retrieve_context(question, req.top_k, project_id=req.project_id)
+    # 两路检索：项目资料 + 成果台账；各取一半额度，合并后总量仍受 MAX_CHUNKS 约束
+    total = max(1, min(req.top_k if req.top_k else MAX_CHUNKS, MAX_CHUNKS))
+    half = max(1, total // 2)
+    chunks, references = _retrieve_context(question, half, project_id=req.project_id)
+    ach_chunks, ach_refs = _retrieve_achievement_context(question, half, project_id=req.project_id)
+    chunks = chunks + ach_chunks
+    references = references + ach_refs
+
     if not chunks:
         return {
             "answer": "资料中没有找到相关内容。请尝试更换关键词，或先上传相关文档。",

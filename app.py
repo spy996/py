@@ -1079,12 +1079,12 @@ def api_documents_summarize(project_id, question):
 
 
 def api_ask(question, top_k=5, project_id=None):
-    """调用后端 /ask 智能问答接口（深度回答可能较慢，超时放宽到 300s）"""
+    """调用后端 /ask 智能问答接口（深度回答可能较慢 + 回答截断自动续写，超时放宽到 600s）"""
     try:
         resp = requests.post(
             f"{API_BASE}/ask",
             json={"question": question, "top_k": top_k, "project_id": project_id},
-            timeout=300,
+            timeout=600,
         )
         return resp
     except Exception as e:

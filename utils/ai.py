@@ -85,8 +85,11 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
     return chunks
 
 
+MAX_CONTINUATIONS = 3  # 回答因 max_tokens 被截断时，最多额外续写次数
+
+
 def _call_deepseek(question: str, context: str) -> str:
-    """调用 DeepSeek API，仅依据资料回答问题"""
+    """调用 DeepSeek API，仅依据资料回答问题；回答被截断时自动续写补全。"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
@@ -104,17 +107,29 @@ def _call_deepseek(question: str, context: str) -> str:
         "不要机械地在每个数字后加括号堆砌来源。\n"
         "5. 语气专业、自然、易读，避免机械罗列和重复。"
     )
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}"},
-        ],
-        "temperature": 0.6,
-        "max_tokens": 8100,
-        "stream": False,
-    }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"资料：\n{context}\n\n问题：{question}"},
+    ]
+    parts = []
+    # 首答 + 最多 MAX_CONTINUATIONS 次续写；只有 finish_reason=="length"（因 max_tokens 截断）
+    # 且确实有内容时才续写，空内容/正常结束都立即停止，避免死循环。
+    for _ in range(MAX_CONTINUATIONS + 1):
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "temperature": 0.6,
+            "max_tokens": 8100,
+            "stream": False,
+        }
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+        resp.raise_for_status()
+        choice = resp.json()["choices"][0]
+        content = (choice.get("message", {}).get("content") or "").strip()
+        finish = choice.get("finish_reason")
+        parts.append(content)
+        if not content or finish != "length":
+            break
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": "请继续补充，从上一次中断处接着写，不要重复前面的内容。"})
+    return "".join(parts)
