@@ -783,39 +783,390 @@ def search_files(q: str, db: Session = Depends(get_db)):
     return results
 
 
+# ============ 统计意图路由（阶段 2）：统计/列举类问题走 SQL 精确查询 ============
+# 判断是否统计/列举意图的动词
+STAT_VERBS = [
+    "一共", "总共", "多少", "多少份", "多少笔", "多少项", "哪些", "哪几",
+    "有几", "几个", "几份", "几笔", "合计", "总计", "求和", "总金额", "总额",
+    "汇总", "统计", "分布", "平均", "到账", "结余", "预算", "支出", "累计", "共有",
+]
+
+# 预定义统计查询表：name / kind(agg聚合|list明细) / 触发实体词 ent / 可选细分词 sub / 展示 label / 单位 unit
+_STAT_DEFS = [
+    # ---- 合同 ----
+    {"name": "contract_count_total",     "kind": "agg",  "ent": ["合同", "合约", "协议"], "sub": None, "label": "合同总数", "unit": "份"},
+    {"name": "contract_amount_total",    "kind": "agg",  "ent": ["合同", "合约", "协议"], "sub": ["金额", "总额", "合计", "总计", "价款", "钱"], "label": "合同总金额", "unit": "元"},
+    {"name": "contract_count_by_type",   "kind": "agg",  "ent": ["合同", "合约", "协议"], "sub": ["类型", "分布", "分类", "种类", "构成"], "label": "合同类型分布", "unit": "份"},
+    {"name": "contract_count_by_status", "kind": "agg",  "ent": ["合同", "合约", "协议"], "sub": ["状态", "超期", "临期", "到期"], "label": "合同状态分布", "unit": "份"},
+    # ---- 经费 ----
+    {"name": "funding_income",   "kind": "agg", "ent": ["经费", "资金", "拨款", "费用"], "sub": ["到账", "收入", "到位", "实到"], "label": "到账经费", "unit": "元"},
+    {"name": "funding_budget",   "kind": "agg", "ent": ["经费", "资金", "拨款", "费用"], "sub": ["预算"], "label": "预算经费", "unit": "元"},
+    {"name": "funding_expense",  "kind": "agg", "ent": ["经费", "资金", "拨款", "费用"], "sub": ["支出", "花费", "开销"], "label": "支出经费", "unit": "元"},
+    {"name": "funding_balance",  "kind": "agg", "ent": ["经费", "资金", "拨款", "费用"], "sub": ["结余", "余额", "剩余", "还剩"], "label": "经费结余", "unit": "元"},
+    {"name": "funding_by_type",  "kind": "agg", "ent": ["经费", "资金", "拨款", "费用"], "sub": ["类型", "分布", "分类", "构成"], "label": "经费类型分布", "unit": "元"},
+    # ---- 成果（平台级资产，不按 project_id 过滤，未关联项目的专利/软著也计入）----
+    {"name": "achievement_count_total",      "kind": "agg",  "ent": ["成果", "专利", "论文", "软著", "著作权", "获奖", "标准", "鉴定"], "sub": None, "label": "成果总数", "unit": "项"},
+    {"name": "achievement_count_by_status",  "kind": "agg",  "ent": ["成果", "专利", "论文", "软著", "著作权", "获奖", "标准"], "sub": ["状态", "分布", "在研"], "label": "成果状态分布", "unit": "项"},
+    {"name": "achievement_count_by_category","kind": "agg",  "ent": ["成果"], "sub": ["类型", "分布", "分类", "种类", "构成"], "label": "成果类型分布", "unit": "项"},
+    {"name": "achievement_status_count",     "kind": "agg",  "ent": ["成果", "专利", "论文", "软著", "著作权", "获奖", "标准"], "sub": ["已授权", "授权了", "已发表", "已登记", "已获奖", "已发布"], "label": "已取得成果数", "unit": "项"},
+    {"name": "achievement_authorized",       "kind": "list", "ent": ["成果", "专利", "论文", "软著", "著作权", "获奖", "标准"], "sub": ["已授权", "已发表", "已登记", "已获奖", "已发布", "授权了"], "label": "已取得成果", "unit": ""},
+    # ---- 待办 ----
+    {"name": "todo_unhandled_count", "kind": "agg",  "ent": ["待办", "提醒", "事项", "任务"], "sub": ["未处理", "待处理", "未完成", "未办"], "label": "未处理待办数", "unit": "项"},
+    {"name": "todo_recent",          "kind": "list", "ent": ["待办", "提醒", "事项", "任务"], "sub": ["最近", "最新", "近期", "接下来"], "label": "最近待办", "unit": ""},
+]
+
+_STAT_DEF_BY_NAME = {d["name"]: d for d in _STAT_DEFS}
+
+# 统计/列举明细只喂给 LLM 的前 N 条「示例」（references 仍返回全量，避免上下文过长 + LLM 逐条罗列）
+LIST_CONTEXT_CAP = 5
+
+
+def _detect_achievement_category(q: str):
+    """从问题里检测成果类型词，用于成果统计/明细二次过滤（如「有多少专利」只数专利，不含论文/软著）。
+    返回 category 值或 None。"""
+    for k, v in [
+        ("专利", "专利"), ("论文", "论文"), ("软著", "软件著作权"), ("著作权", "软件著作权"),
+        ("获奖", "获奖"), ("标准", "标准"), ("鉴定", "鉴定报告"),
+    ]:
+        if k in q:
+            return v
+    return None
+
+
+def _detect_achievement_status(q: str):
+    """从问题里检测成果状态词（已授权/已发表/已登记/已获奖/已发布），用于明细精确过滤。
+    返回 status 值或 None。"""
+    for k, v in [
+        ("已授权", "已授权"), ("授权了", "已授权"), ("已发表", "已发表"), ("已登记", "已登记"),
+        ("已获奖", "已获奖"), ("已发布", "已发布"),
+    ]:
+        if k in q:
+            return v
+    return None
+
+
+def _fmt_num(v):
+    """金额/数量千分位格式化，整数不带小数、浮点保留 2 位。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if v == int(v):
+        return f"{int(v):,}"
+    return f"{v:,.2f}"
+
+
+def _detect_stat_queries(q: str):
+    """统计/列举意图路由：命中 STAT_VERBS 且匹配预定义查询实体词时，返回命中的查询名列表。
+    未命中返回 []（由 /ask 回退到全文检索）。纯规则判定，不额外调用 LLM，零延迟。"""
+    q = (q or "").strip()
+    if not q:
+        return []
+    if not any(v in q for v in STAT_VERBS):
+        return []
+    names = []
+    for d in _STAT_DEFS:
+        if not any(e in q for e in d["ent"]):
+            continue
+        if d["sub"] and not any(s in q for s in d["sub"]):
+            continue
+        names.append(d["name"])
+    return names
+
+
+# ---- 聚合查询执行器（受 project_id 下推；成果例外——平台级共享不过滤）----
+def _agg_contract_count_total(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.count(Contract.id))
+    if project_id is not None:
+        q = q.filter(Contract.project_id == project_id)
+    return {"name": "contract_count_total", "label": "合同总数", "value": q.scalar() or 0, "unit": "份"}
+
+
+def _agg_contract_amount_total(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.sum(func.coalesce(func.nullif(Contract.amount_incl_tax, 0), Contract.amount_value, 0)))
+    if project_id is not None:
+        q = q.filter(Contract.project_id == project_id)
+    return {"name": "contract_amount_total", "label": "合同总金额", "value": round(q.scalar() or 0, 2), "unit": "元"}
+
+
+def _agg_contract_count_by_type(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(Contract.contract_type, func.count(Contract.id))
+    if project_id is not None:
+        q = q.filter(Contract.project_id == project_id)
+    rows = q.group_by(Contract.contract_type).all()
+    detail = [(t or "未分类", c) for t, c in rows]
+    return {"name": "contract_count_by_type", "label": "合同类型分布", "value": None, "unit": "份", "detail": detail}
+
+
+def _agg_contract_count_by_status(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(Contract)
+    if project_id is not None:
+        q = q.filter(Contract.project_id == project_id)
+    by = {"已超期": 0, "即将到期": 0, "正常": 0, "未识别": 0}
+    for c in q.all():
+        st_, _ = _contract_status(c.due_date)
+        by[st_] = by.get(st_, 0) + 1
+    detail = [(k, v) for k, v in by.items()]
+    return {"name": "contract_count_by_status", "label": "合同状态分布", "value": None, "unit": "份", "detail": detail}
+
+
+def _agg_funding_income(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "到账")
+    if project_id is not None:
+        q = q.filter(Funding.project_id == project_id)
+    return {"name": "funding_income", "label": "到账经费", "value": round(q.scalar() or 0, 2), "unit": "元"}
+
+
+def _agg_funding_budget(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "预算")
+    if project_id is not None:
+        q = q.filter(Funding.project_id == project_id)
+    return {"name": "funding_budget", "label": "预算经费", "value": round(q.scalar() or 0, 2), "unit": "元"}
+
+
+def _agg_funding_expense(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "支出")
+    if project_id is not None:
+        q = q.filter(Funding.project_id == project_id)
+    return {"name": "funding_expense", "label": "支出经费", "value": round(q.scalar() or 0, 2), "unit": "元"}
+
+
+def _agg_funding_balance(project_id, db, ach_category=None, ach_status=None):
+    inc_q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "到账")
+    exp_q = db.query(func.sum(Funding.amount)).filter(Funding.fund_type == "支出")
+    if project_id is not None:
+        inc_q = inc_q.filter(Funding.project_id == project_id)
+        exp_q = exp_q.filter(Funding.project_id == project_id)
+    return {"name": "funding_balance", "label": "经费结余", "value": round((inc_q.scalar() or 0) - (exp_q.scalar() or 0), 2), "unit": "元"}
+
+
+def _agg_funding_by_type(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(Funding.fund_type, func.sum(Funding.amount))
+    if project_id is not None:
+        q = q.filter(Funding.project_id == project_id)
+    rows = q.group_by(Funding.fund_type).all()
+    detail = [(t or "其他", round(a or 0, 2)) for t, a in rows]
+    return {"name": "funding_by_type", "label": "经费类型分布", "value": None, "unit": "元", "detail": detail}
+
+
+def _agg_achievement_count_total(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.count(Achievement.id))
+    if ach_category:
+        q = q.filter(Achievement.category == ach_category)
+    return {"name": "achievement_count_total", "label": "成果总数", "value": q.scalar() or 0, "unit": "项"}
+
+
+def _agg_achievement_count_by_status(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(Achievement.status, func.count(Achievement.id))
+    if ach_category:
+        q = q.filter(Achievement.category == ach_category)
+    rows = q.group_by(Achievement.status).all()
+    detail = [(s or "其他", c) for s, c in rows]
+    return {"name": "achievement_count_by_status", "label": "成果状态分布", "value": None, "unit": "项", "detail": detail}
+
+
+def _agg_achievement_count_by_category(project_id, db, ach_category=None, ach_status=None):
+    rows = db.query(Achievement.category, func.count(Achievement.id)).group_by(Achievement.category).all()
+    detail = [(s or "其他", c) for s, c in rows]
+    return {"name": "achievement_count_by_category", "label": "成果类型分布", "value": None, "unit": "项", "detail": detail}
+
+
+def _agg_achievement_status_count(project_id, db, ach_category=None, ach_status=None):
+    q = db.query(func.count(Achievement.id))
+    if ach_status:
+        q = q.filter(Achievement.status == ach_status)
+    if ach_category:
+        q = q.filter(Achievement.category == ach_category)
+    label = f"{ach_status or '已取得'}成果数"
+    return {"name": "achievement_status_count", "label": label, "value": q.scalar() or 0, "unit": "项"}
+
+
+def _agg_todo_unhandled_count(project_id, db, ach_category=None, ach_status=None):
+    return {"name": "todo_unhandled_count", "label": "未处理待办数", "value": db.query(func.count(Todo.id)).filter(Todo.status == "未处理").scalar() or 0, "unit": "项"}
+
+
+_AGG_HANDLERS = {
+    "contract_count_total": _agg_contract_count_total,
+    "contract_amount_total": _agg_contract_amount_total,
+    "contract_count_by_type": _agg_contract_count_by_type,
+    "contract_count_by_status": _agg_contract_count_by_status,
+    "funding_income": _agg_funding_income,
+    "funding_budget": _agg_funding_budget,
+    "funding_expense": _agg_funding_expense,
+    "funding_balance": _agg_funding_balance,
+    "funding_by_type": _agg_funding_by_type,
+    "achievement_count_total": _agg_achievement_count_total,
+    "achievement_count_by_status": _agg_achievement_count_by_status,
+    "achievement_count_by_category": _agg_achievement_count_by_category,
+    "achievement_status_count": _agg_achievement_status_count,
+    "todo_unhandled_count": _agg_todo_unhandled_count,
+}
+
+
+def _run_stat_queries(names, project_id, db, ach_category=None, ach_status=None):
+    """执行 agg 聚合查询，返回 (items, lines)。
+    items: [{name,label,value,unit,detail}] 供前端结构化展示；
+    lines: ["合同总数：12 份", ...] 供拼进 LLM prompt 的【精确统计结果】。"""
+    items, lines, seen = [], [], set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        fn = _AGG_HANDLERS.get(name)
+        if not fn:
+            continue
+        try:
+            item = fn(project_id, db, ach_category, ach_status)
+        except Exception as e:
+            logger.warning(f"[统计] 查询 {name} 失败：{e}")
+            continue
+        if item is None:
+            continue
+        items.append(item)
+        label, unit = item.get("label", name), item.get("unit", "")
+        detail = item.get("detail")
+        if detail:
+            parts = "、".join(f"{k} {_fmt_num(v)}{unit}" for k, v in detail)
+            lines.append(f"- {label}：{parts}")
+        else:
+            lines.append(f"- {label}：{_fmt_num(item.get('value', 0))}{unit}")
+    return items, lines
+
+
+def _run_list_queries(names, project_id, db, ach_category=None, ach_status=None):
+    """执行 list 明细查询，返回 (chunks, references)。
+    chunks 只喂 LIST_CONTEXT_CAP 条「示例」给 LLM（避免上下文过长），references 返回全量供前端展示/跳转。"""
+    chunks, refs = [], []
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    if "achievement_authorized" in names:
+        q = db.query(Achievement)
+        if ach_status:
+            q = q.filter(Achievement.status == ach_status)
+        if ach_category:
+            q = q.filter(Achievement.category == ach_category)
+        rows = q.order_by(Achievement.achieve_date.desc(), Achievement.id.desc()).all()
+        for a in rows:
+            pname = pmap.get(a.project_id, "") if a.project_id else ""
+            scope = pname or "平台级（未关联项目）"
+            disp = a.name or a.file_name or "成果"
+            meta = "；".join(f"{l}：{v}" for l, v in [
+                ("成果名称", a.name), ("类型", a.category), ("状态", a.status),
+                ("权利人", a.holder), ("申请日期", a.application_date), ("取得日期", a.achieve_date),
+            ] if v)
+            refs.append({
+                "file_id": f"ach-{a.id}", "original_name": disp, "project_id": a.project_id,
+                "project_name": pname, "project_code": "", "category": a.category or "其他",
+                "doc_type": "成果", "stage": "", "download_url": f"/achievements/{a.id}/download" if a.file_path else "",
+                "snippet": meta,
+            })
+        for a in rows[:LIST_CONTEXT_CAP]:
+            pname = pmap.get(a.project_id, "") if a.project_id else ""
+            scope = pname or "平台级（未关联项目）"
+            disp = a.name or a.file_name or "成果"
+            meta = "；".join(f"{l}：{v}" for l, v in [
+                ("成果名称", a.name), ("类型", a.category), ("状态", a.status),
+                ("权利人", a.holder), ("申请日期", a.application_date), ("取得日期", a.achieve_date),
+            ] if v)
+            chunks.append({"label": f"{disp}（{scope}，成果台账）", "text": meta, "file_id": f"ach-{a.id}", "original_name": disp, "snippet": meta})
+    if "todo_recent" in names:
+        rows = db.query(Todo).order_by(Todo.created_at.desc()).limit(10).all()
+        for t in rows:
+            meta = f"待办：{t.title}（{t.category}，级别：{t.level}，状态：{t.status}）"
+            if t.detail:
+                meta += f"；详情：{t.detail}"
+            refs.append({
+                "file_id": f"todo-{t.id}", "original_name": t.title, "project_id": None,
+                "project_name": "", "project_code": "", "category": t.category or "待办",
+                "doc_type": "待办", "stage": "", "download_url": "", "snippet": meta,
+            })
+        for t in rows[:LIST_CONTEXT_CAP]:
+            meta = f"待办：{t.title}（{t.category}，级别：{t.level}，状态：{t.status}）"
+            if t.detail:
+                meta += f"；详情：{t.detail}"
+            chunks.append({"label": f"{t.title}（待办）", "text": meta, "file_id": f"todo-{t.id}", "original_name": t.title, "snippet": meta})
+    return chunks, refs
+
+
+def _build_stat_note(names):
+    """生成统计口径说明（拼在前端 answer 下方的小字）。"""
+    notes = []
+    for n in names:
+        if n == "contract_amount_total":
+            notes.append("合同总金额 = 全部合同含税金额求和（无含税金额的合同退回合同金额），未确认合同亦计入")
+        elif n == "contract_count_total":
+            notes.append("合同总数 = 合同台账全部合同（含未确认）")
+        elif n == "funding_income":
+            notes.append("到账经费 = 经费台账中类型为「到账」的金额合计")
+        elif n == "funding_balance":
+            notes.append("经费结余 = 到账经费 − 支出经费")
+        elif n.startswith("achievement"):
+            notes.append("成果统计含未关联项目的平台级成果")
+    return "；".join(dict.fromkeys(notes))
+
+
 # ============ 健康检查 ============
 # ============ 智能问答接口 ============
 @app.post("/ask", summary="智能问答")
 def ask_question(req: AskRequest):
     """基于知识库内容的智能问答（RAG）：分块检索 + 单次综合回答。
-    通过分块把大文件的任意相关段落都纳入，避免旧版只读文件开头导致回答不全面。"""
+    统计/列举类问题先走 SQL 精确查询（数字由系统计算，不交给 LLM 数数），其余走多源检索。"""
     question = (req.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
 
-    # 两路检索：项目资料 + 成果台账；各取一半额度，合并后总量仍受 MAX_CHUNKS 约束
     total = max(1, min(req.top_k if req.top_k else MAX_CHUNKS, MAX_CHUNKS))
     half = max(1, total // 2)
+
+    # 1) 统计意图路由：命中统计/列举 → SQL 精确查询
+    stat_items, stat_lines, stat_note = [], [], ""
+    list_chunks, list_refs = [], []
+    stat_names = _detect_stat_queries(question)
+    if stat_names:
+        ach_category = _detect_achievement_category(question)
+        ach_status = _detect_achievement_status(question)
+        db = SessionLocal()
+        try:
+            agg_names = [n for n in stat_names if _STAT_DEF_BY_NAME[n]["kind"] == "agg"]
+            list_names = [n for n in stat_names if _STAT_DEF_BY_NAME[n]["kind"] == "list"]
+            stat_items, stat_lines = _run_stat_queries(agg_names, req.project_id, db, ach_category, ach_status)
+            list_chunks, list_refs = _run_list_queries(list_names, req.project_id, db, ach_category, ach_status)
+            stat_note = _build_stat_note(agg_names)
+        finally:
+            db.close()
+
+    # 2) 两路检索：项目资料 + 成果台账（统计未命中时为主检索；命中时用于明细/溯源）
     chunks, references = _retrieve_context(question, half, project_id=req.project_id)
     ach_chunks, ach_refs = _retrieve_achievement_context(question, half, project_id=req.project_id)
-    chunks = chunks + ach_chunks
-    references = references + ach_refs
+    chunks = chunks + ach_chunks + list_chunks
+    references = references + ach_refs + list_refs
 
-    if not chunks:
+    stat_context = ""
+    if stat_lines:
+        stat_context = "【精确统计结果】\n" + "\n".join(stat_lines)
+
+    if not chunks and not stat_lines:
         return {
             "answer": "资料中没有找到相关内容。请尝试更换关键词，或先上传相关文档。",
             "references": [],
+            "stat_note": "",
+            "statistics": [],
         }
 
-    context = "\n\n".join(f"【{c['label']}】\n{c['text']}" for c in chunks)
-    logger.info(f"[问答] 命中 {len(chunks)} 个相关片段 / 共 {len(context)} 字，开始生成回答")
+    context_parts = []
+    if stat_context:
+        context_parts.append(stat_context)
+    if chunks:
+        context_parts.append("\n\n".join(f"【{c['label']}】\n{c['text']}" for c in chunks))
+    context = "\n\n---\n\n".join(context_parts)
+
+    logger.info(f"[问答] 命中 {len(chunks)} 个相关片段 / 统计 {len(stat_lines)} 条 / 共 {len(context)} 字，开始生成回答")
     try:
         answer = _call_deepseek(question, context)
     except Exception as e:
         print(f"[问答] 调用 DeepSeek 失败：{e}")
         raise HTTPException(status_code=500, detail=f"调用 DeepSeek 失败：{e}")
 
-    return {"answer": answer, "references": references}
+    return {"answer": answer, "references": references, "stat_note": stat_note, "statistics": stat_items}
 
 @app.get("/", summary="健康检查")
 def health_check():

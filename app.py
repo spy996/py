@@ -1078,6 +1078,17 @@ def api_documents_summarize(project_id, question):
         return None
 
 
+def _fmt_stat_num(v):
+    """前端统计数字格式化：整数不带小数、浮点保留 2 位，千分位。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if v == int(v):
+        return f"{int(v):,}"
+    return f"{v:,.2f}"
+
+
 def api_ask(question, top_k=5, project_id=None):
     """调用后端 /ask 智能问答接口（深度回答可能较慢 + 回答截断自动续写，超时放宽到 600s）"""
     try:
@@ -1143,17 +1154,8 @@ def render_ask_page():
         if not q:
             st.warning("请先输入问题")
         else:
-            STATS_WORDS = ["统计", "汇总", "一共", "总共", "合计", "总计", "多少份", "多少笔", "有哪些", "分布", "平均"]
-            DOC_WORDS = ["总结", "概览", "梳理", "归纳", "资料", "方案", "报告", "纪要", "文档"]
-            is_doc = selected_project_id is not None and any(w in q for w in DOC_WORDS)
-            is_stats = selected_project_id is not None and any(w in q for w in STATS_WORDS)
             with st.spinner("正在检索资料并生成答案，请稍候……"):
-                if is_doc:
-                    resp = api_documents_summarize(selected_project_id, q)
-                elif is_stats:
-                    resp = api_project_stats(selected_project_id, q)
-                else:
-                    resp = api_ask(q, top_k=1100, project_id=selected_project_id)
+                resp = api_ask(q, top_k=1100, project_id=selected_project_id)
 
             if resp is None:
                 pass  # 错误已在 api_ask 中提示
@@ -1163,10 +1165,14 @@ def render_ask_page():
                 data = resp.json()
                 answer = data.get("answer", "")
                 references = data.get("references", [])
+                statistics = data.get("statistics", [])
+                stat_note = data.get("stat_note", "")
                 st.session_state.chat_history.append({
                     "question": q,
                     "answer": answer,
                     "references": references,
+                    "statistics": statistics,
+                    "stat_note": stat_note,
                 })
                 _save_chat_history(st.session_state.chat_history)
 
@@ -1175,7 +1181,22 @@ def render_ask_page():
         st.info("还没有提问记录，试试问一个知识库里已有的问题吧。")
     for item in reversed(st.session_state.chat_history):
         st.markdown(f"**🙋 你：** {item['question']}")
+        stats = item.get("statistics") or []
+        if stats:
+            st.markdown("**📊 统计结果：**")
+            for s in stats:
+                label = s.get("label", "")
+                detail = s.get("detail")
+                unit = s.get("unit", "")
+                if detail:
+                    dtext = "；".join(f"{k}：{_fmt_stat_num(v)}{unit}" for k, v in detail)
+                    st.markdown(f"- {label}：{dtext}")
+                else:
+                    st.markdown(f"- {label}：{_fmt_stat_num(s.get('value', 0))}{unit}")
         st.markdown(f"**🤖 AI：** {item['answer']}")
+        note = item.get("stat_note", "")
+        if note:
+            st.caption(f"📐 统计口径：{note}")
         if item.get("references"):
             st.markdown("**📎 参考资料：**")
             for ref in item["references"]:
