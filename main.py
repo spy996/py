@@ -4816,6 +4816,7 @@ class AchievementCreate(BaseModel):
     category: Optional[str] = "其他"
     status: Optional[str] = "其他"
     holder: Optional[str] = None
+    accept_date: Optional[str] = None
     achieve_date: Optional[str] = None
     remark: Optional[str] = None
 
@@ -4827,6 +4828,7 @@ class AchievementUpdate(BaseModel):
     category: str = "其他"
     status: str = "其他"
     holder: Optional[str] = None
+    accept_date: Optional[str] = None
     achieve_date: Optional[str] = None
     remark: Optional[str] = None
 
@@ -4840,6 +4842,7 @@ def _achievement_to_dict(a: Achievement, project_name: str = "") -> dict:
         "category": a.category or "其他",
         "status": a.status or "其他",
         "holder": a.holder or "",
+        "accept_date": a.accept_date or "",
         "achieve_date": a.achieve_date or "",
         "remark": a.remark or "",
         "file_name": a.file_name or "",
@@ -4861,6 +4864,7 @@ def create_achievement(req: AchievementCreate, db: Session = Depends(get_db)):
         category=req.category or "其他",
         status=req.status or "其他",
         holder=req.holder or None,
+        accept_date=req.accept_date or None,
         achieve_date=req.achieve_date or None,
         remark=req.remark or None,
     )
@@ -4877,6 +4881,7 @@ async def create_achievement_manual(
     category: str = Form("其他"),
     status: str = Form("其他"),
     holder: Optional[str] = Form(None),
+    accept_date: Optional[str] = Form(None),
     achieve_date: Optional[str] = Form(None),
     remark: Optional[str] = Form(None),
     project_id: Optional[int] = Form(None),
@@ -4907,6 +4912,7 @@ async def create_achievement_manual(
         category=category or "其他",
         status=status or "其他",
         holder=holder or None,
+        accept_date=accept_date or None,
         achieve_date=achieve_date or None,
         remark=remark or None,
         file_name=file_name,
@@ -4978,6 +4984,7 @@ def update_achievement(achievement_id: int, req: AchievementUpdate, db: Session 
     a.category = req.category or "其他"
     a.status = req.status or "其他"
     a.holder = req.holder or None
+    a.accept_date = req.accept_date or None
     a.achieve_date = req.achieve_date or None
     a.remark = req.remark or None
     db.commit()

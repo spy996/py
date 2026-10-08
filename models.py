@@ -271,6 +271,7 @@ class Achievement(Base):
     category = Column(String, nullable=True)      # 类型：专利/论文/软件著作权/获奖/标准/成果登记/鉴定报告/其他
     status = Column(String, nullable=True)        # 状态：在研/已授权/已发表/已登记/已获奖/已发布/其他
     holder = Column(String, nullable=True)        # 权利人/作者/完成人
+    accept_date = Column(String, nullable=True)   # 受理日期（专利/申请的受理日）
     achieve_date = Column(String, nullable=True)  # 取得日期
     remark = Column(String, nullable=True)        # 备注
     file_name = Column(String, nullable=True)     # 上传的成果文件名（可下载查看）
@@ -360,6 +361,7 @@ if "contracts" in _inspector.get_table_names():
 if "achievements" in _inspector.get_table_names():
     _acols = [c["name"] for c in _inspector.get_columns("achievements")]
     for _col, _type in [
+        ("accept_date", "VARCHAR"),
         ("file_name", "VARCHAR(500)"),
         ("file_path", "VARCHAR(1000)"),
         ("processing_status", "VARCHAR(20)"),
@@ -386,6 +388,7 @@ if "achievements" in _inspector.get_table_names():
                     category VARCHAR,
                     status VARCHAR,
                     holder VARCHAR,
+                    accept_date VARCHAR,
                     achieve_date VARCHAR,
                     remark VARCHAR,
                     file_name VARCHAR(500),
@@ -397,8 +400,8 @@ if "achievements" in _inspector.get_table_names():
                 )
             """))
             _conn.execute(text("""
-                INSERT INTO achievements (id, project_id, name, category, status, holder, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at)
-                SELECT id, project_id, name, category, status, holder, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at
+                INSERT INTO achievements (id, project_id, name, category, status, holder, accept_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at)
+                SELECT id, project_id, name, category, status, holder, accept_date, achieve_date, remark, file_name, file_path, processing_status, source, source_file_id, created_at
                 FROM achievements_old
             """))
             _conn.execute(text("DROP TABLE achievements_old"))
