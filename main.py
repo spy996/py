@@ -19,7 +19,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request, Form
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from sqlalchemy import text, func
 from sqlalchemy.orm import Session
 
@@ -27,7 +27,7 @@ from constants import PROJECT_STAGES, AMOUNT_KINDS
 from utils.text_extract import extract_text_from_file, is_supported_file, _pdf_needs_ocr
 from config import BASE_DIR, ENV, UPLOAD_DIR, EXTRACT_DIR, DATABASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_API_URL, logger, _append_env
 from utils.storage import _content_path, _save_content, _load_content
-from utils.ai import _fallback_terms, _expand_query, _chunk_text, _call_deepseek
+from utils.ai import _fallback_terms, _expand_query, _chunk_text, _call_deepseek, _call_deepseek_stream
 from database import engine, SessionLocal, Base, get_db
 from models import (
     Project, ProjectFile, ContractSummary, DocumentSummary, Contract,
@@ -74,7 +74,7 @@ SOURCE_QUOTA = {
 
 EXACT_BONUS = 5.0       # 精确字段命中加成（合同编号 / 项目编码 / 成果名称）
 
-LIST_CONTEXT_CAP = 5    # 明细类统计喂给 LLM 的「示例」条数上限（references 仍返回全量，供前端逐条查看）
+LIST_CONTEXT_CAP = 30   # 明细类统计喂给 LLM 的「示例」条数上限（references 仍返回全量，供前端逐条查看）
 
 
 # ============ 多源问答：卡片文本化 / 打分 / 装配 ============
@@ -1426,14 +1426,9 @@ def search_files(q: str, db: Session = Depends(get_db)):
 
 # ============ 健康检查 ============
 # ============ 智能问答接口 ============
-@app.post("/ask", summary="智能问答")
-def ask_question(req: AskRequest, db: Session = Depends(get_db)):
-    """基于知识库内容的智能问答（RAG）：多源混合检索 + 统计意图路由 + 单次综合回答。
-    统计类问题由数据库精确计算；查找类问题按多源配额装配知识片段；两种场景均单次调用 DeepSeek 生成回答。"""
+def _build_ask_context(req: AskRequest, db: Session):
+    """构建问答上下文（统计意图 + 多源检索 + 明细 merge）。返回 (question, context, references, stat_note, sources)。"""
     question = (req.question or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="问题不能为空")
-
     sources = [s for s in (req.sources or []) if s in QA_SOURCES]
 
     # 1) 统计意图：规则判定 + 预定义聚合/明细查询（零额外 LLM 调用）
@@ -1483,18 +1478,28 @@ def ask_question(req: AskRequest, db: Session = Depends(get_db)):
     if len(chunks) > MAX_CHUNKS:
         chunks = chunks[:MAX_CHUNKS]
 
-    if not chunks and not stat_context:
-        return {
-            "answer": _build_empty_answer(sources),
-            "references": [],
-            "stat_note": stat_note,
-        }
-
     context = ""
     if stat_context:
         context += stat_context + "\n\n---\n\n"
     context += "\n\n".join(f"【{c['label']}】\n{c['text']}" for c in chunks)
     logger.info(f"[问答] 命中 {len(chunks)} 个相关片段 / 共 {len(context)} 字，开始生成回答")
+    return question, context, references, stat_note, sources
+
+
+@app.post("/ask", summary="智能问答")
+def ask_question(req: AskRequest, db: Session = Depends(get_db)):
+    """基于知识库内容的智能问答（RAG）：多源混合检索 + 统计意图路由 + 单次综合回答。"""
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
+    question, context, references, stat_note, sources = _build_ask_context(req, db)
+    if not context.strip():
+        return {
+            "answer": _build_empty_answer(sources),
+            "references": [],
+            "stat_note": "",
+        }
     try:
         answer = _call_deepseek(question, context)
     except Exception as e:
@@ -1502,6 +1507,31 @@ def ask_question(req: AskRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"调用 DeepSeek 失败：{e}")
 
     return {"answer": answer, "references": references, "stat_note": stat_note}
+
+
+@app.post("/ask/stream", summary="智能问答（流式）")
+def ask_question_stream(req: AskRequest, db: Session = Depends(get_db)):
+    """流式智能问答：SSE 逐段返回回答增量，末尾以 done 事件携带 references/stat_note。"""
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
+    question, context, references, stat_note, sources = _build_ask_context(req, db)
+
+    def gen():
+        if not context.strip():
+            yield f"data: {json.dumps({'delta': _build_empty_answer(sources)}, ensure_ascii=False)}\n\n"
+        else:
+            try:
+                for piece in _call_deepseek_stream(question, context):
+                    yield f"data: {json.dumps({'delta': piece}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.error(f"[问答] 流式调用 DeepSeek 失败：{e}")
+                yield f"data: {json.dumps({'error': f'调用 DeepSeek 失败：{e}'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'done': True, 'references': references, 'stat_note': stat_note}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 @app.get("/", summary="健康检查")
 def health_check():
     return {"status": "ok", "message": "研发知识智能管理平台运行中"}

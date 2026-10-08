@@ -1106,6 +1106,42 @@ def api_ask(question, top_k=40, project_id=None, sources=None):
         return None
 
 
+def api_ask_stream(question, top_k=40, project_id=None, sources=None, meta=None):
+    """流式调用后端 /ask/stream，逐段 yield 回答文本；结束后把 references/stat_note/error 写入 meta。"""
+    payload = {"question": question, "top_k": top_k, "project_id": project_id}
+    if sources:
+        payload["sources"] = sources
+    if meta is None:
+        meta = {}
+    try:
+        resp = requests.post(f"{API_BASE}/ask/stream", json=payload, stream=True, timeout=600)
+    except Exception as e:
+        meta["error"] = f"智能问答请求失败：{e}"
+        return
+    if resp.status_code != 200:
+        meta["error"] = f"问答失败：{resp.text}"
+        return
+    for raw in resp.iter_lines(decode_unicode=True):
+        if not raw or not raw.startswith("data:"):
+            continue
+        data_str = raw[len("data:"):].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            obj = json.loads(data_str)
+        except Exception:
+            continue
+        if obj.get("done"):
+            meta["references"] = obj.get("references", [])
+            meta["stat_note"] = obj.get("stat_note", "")
+            break
+        if obj.get("error"):
+            meta["error"] = obj["error"]
+            return
+        if obj.get("delta"):
+            yield obj["delta"]
+
+
 def api_cross_project(question):
     """调用后端 /cross-project/analyze 跨项目统计与报告接口"""
     try:
@@ -1167,25 +1203,22 @@ def render_ask_page():
         if not q:
             st.warning("请先输入问题")
         else:
-            with st.spinner("正在检索资料并生成答案，请稍候……"):
-                resp = api_ask(q, top_k=40, project_id=selected_project_id, sources=sources)
-
-            if resp is None:
-                pass  # 错误已在 api_ask 中提示
-            elif resp.status_code != 200:
-                st.error(f"问答失败：{resp.text}")
+            meta = {}
+            with st.spinner("正在检索资料……"):
+                answer = st.write_stream(
+                    api_ask_stream(q, top_k=40, project_id=selected_project_id, sources=sources, meta=meta)
+                )
+            if meta.get("error"):
+                st.error(meta["error"])
             else:
-                data = resp.json()
-                answer = data.get("answer", "")
-                references = data.get("references", [])
-                stat_note = data.get("stat_note", "")
                 st.session_state.chat_history.append({
                     "question": q,
-                    "answer": answer,
-                    "references": references,
-                    "stat_note": stat_note,
+                    "answer": answer or "",
+                    "references": meta.get("references", []),
+                    "stat_note": meta.get("stat_note", ""),
                 })
                 _save_chat_history(st.session_state.chat_history)
+                st.rerun()
 
     # 显示聊天历史（最新在前，不用往下滚动）
     if not st.session_state.chat_history:
