@@ -95,8 +95,12 @@ def _retrieve_context(question: str, top_k: int = 5, project_id: Optional[int] =
         # 2) 逐块打分（词频加权，文件名命中给少量加成）
         scored_chunks = []
         for f, p in rows:
-            content = _load_content(f)
-            if not content.strip():
+            try:
+                content = _load_content(f)
+            except Exception as e:
+                logger.warning(f"[检索] 读取文件内容失败（已跳过）{f.original_name}：{e}")
+                continue
+            if not content or not content.strip():
                 continue
             name_bonus = sum(max(1, len(k) // 2) for k in kw_lower if k in f.original_name.lower()) * 3
             for ci, ch in enumerate(_chunk_text(content)):
