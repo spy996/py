@@ -3004,8 +3004,6 @@ elif menu == "🏆 成果台账":
                 continue
             filtered.append(a)
 
-        st.caption(f"筛选结果 {len(filtered)} / 共 {len(items)} 条")
-
         rows = []
         for a in filtered:
             rows.append({
@@ -3022,6 +3020,24 @@ elif menu == "🏆 成果台账":
                 "关联文件": a.get("file_name") or "",
             })
         df = pd.DataFrame(rows)
+
+        # 筛选结果计数 + 下载 Excel 按钮（同一行）
+        cap_c, dl_c = st.columns([3, 1])
+        with cap_c:
+            st.caption(f"筛选结果 {len(filtered)} / 共 {len(items)} 条")
+        with dl_c:
+            import io
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="成果筛选结果")
+            st.download_button(
+                "📥 下载 Excel",
+                data=buf.getvalue(),
+                file_name=f"成果筛选结果_{len(filtered)}条.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ach_download_excel",
+            )
+
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         id_map = {f"{a['id']}": a for a in items}
