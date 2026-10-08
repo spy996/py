@@ -1203,22 +1203,22 @@ def render_ask_page():
         if not q:
             st.warning("请先输入问题")
         else:
-            meta = {}
-            with st.spinner("正在检索资料……"):
-                answer = st.write_stream(
-                    api_ask_stream(q, top_k=40, project_id=selected_project_id, sources=sources, meta=meta)
-                )
-            if meta.get("error"):
-                st.error(meta["error"])
+            with st.spinner("正在检索资料并生成答案，请稍候……"):
+                resp = api_ask(q, top_k=40, project_id=selected_project_id, sources=sources)
+
+            if resp is None:
+                pass  # 错误已在 api_ask 中提示
+            elif resp.status_code != 200:
+                st.error(f"问答失败：{resp.text}")
             else:
+                data = resp.json()
                 st.session_state.chat_history.append({
                     "question": q,
-                    "answer": answer or "",
-                    "references": meta.get("references", []),
-                    "stat_note": meta.get("stat_note", ""),
+                    "answer": data.get("answer", ""),
+                    "references": data.get("references", []),
+                    "stat_note": data.get("stat_note", ""),
                 })
                 _save_chat_history(st.session_state.chat_history)
-                st.rerun()
 
     # 显示聊天历史（最新在前，不用往下滚动）
     if not st.session_state.chat_history:
