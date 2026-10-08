@@ -462,6 +462,16 @@ def api_batch_delete_achievements(ids):
         return None
 
 
+def api_achievement_reidentify(ids=None):
+    """批量重新识别已有成果（后台重新提取证书申请日期等字段）。ids 为空表示全量。"""
+    try:
+        payload = {"ids": ids} if ids else {}
+        return requests.post(f"{API_BASE}/achievements/reidentify", json=payload, timeout=30)
+    except Exception as e:
+        st.error(f"批量重新识别请求失败：{e}")
+        return None
+
+
 # ============ 提醒中心 / 数据大屏 API ============
 def api_reminders():
     try:
@@ -2893,6 +2903,25 @@ elif menu == "🏆 成果台账":
         st.divider()
 
     st.subheader("📋 成果明细")
+
+    # —— 批量重新识别：后台重新提取证书「申请日期」等字段 ——
+    with st.container(border=True):
+        st.markdown("**🔄 批量重新识别**")
+        st.caption("针对已有成果，后台重新读取证书文件并用 AI 提取「申请日期」等缺失字段；已登记/已修正的字段不会被覆盖。")
+        c_reid1, c_reid2 = st.columns([3, 1])
+        with c_reid1:
+            reid_confirm = st.checkbox("我确认对全部成果重新识别（耗时较长，需等待后台处理）", key="ach_reid_confirm")
+        with c_reid2:
+            if st.button("🔄 开始批量重新识别", key="ach_reid_btn", disabled=not reid_confirm, use_container_width=True):
+                r = api_achievement_reidentify()
+                if r is not None and r.status_code == 200:
+                    d = r.json()
+                    st.success(f"已触发 {d.get('count', 0)} 条成果的后台重新识别，稍后刷新页面查看「申请日期」回填结果")
+                    st.session_state.pop("ach_reid_confirm", None)
+                    st.rerun()
+                else:
+                    st.error("触发失败，请稍后重试")
+
     items = api_list_achievements()
     if not items:
         st.info("暂无成果记录。")

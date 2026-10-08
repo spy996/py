@@ -4018,6 +4018,61 @@ def _process_achievement_async(achievement_id: int, file_path: str, original_nam
         db.close()
 
 
+def _reidentify_achievement_async(achievement_id: int, file_path: str, original_name: str):
+    """后台线程：重新识别已有成果文件，回填缺失字段（重点补「申请日期」，不覆盖已有值）。"""
+    db = SessionLocal()
+    try:
+        content = ""
+        try:
+            content = extract_text_from_file(file_path)
+        except Exception as e:
+            logger.error(f"[成果重识别] 提取文本失败 {original_name}：{e}")
+
+        fields = {}
+        if content and content.strip():
+            try:
+                fields = _extract_achievement_fields(content, original_name)
+            except Exception as e:
+                logger.error(f"[成果重识别] 识别字段失败 {original_name}：{e}")
+
+        a = db.query(Achievement).filter(Achievement.id == achievement_id).first()
+        if a is None:
+            return
+
+        # 申请日期：识别到非空就覆盖（本次重识别的核心目标）
+        new_app_date = (fields.get("application_date") or "").strip()
+        if new_app_date:
+            a.application_date = new_app_date
+
+        # 其余字段仅在当前为空时回填，避免覆盖已登记/已修正的值
+        for attr, key in [
+            ("name", "name"),
+            ("category", "category"),
+            ("status", "status"),
+            ("holder", "holder"),
+            ("achieve_date", "achieve_date"),
+            ("remark", "remark"),
+        ]:
+            val = (fields.get(key) or "").strip()
+            if val and not getattr(a, attr, None):
+                setattr(a, attr, val)
+
+        a.processing_status = "done"
+        db.commit()
+        logger.info(f"[成果重识别] 完成 {original_name}")
+    except Exception as e:
+        logger.error(f"[成果重识别] 处理异常 {original_name}：{e}")
+        try:
+            a = db.query(Achievement).filter(Achievement.id == achievement_id).first()
+            if a is not None:
+                a.processing_status = "error"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 class AchievementCreate(BaseModel):
     project_id: Optional[int] = None
     name: str
@@ -4178,6 +4233,36 @@ async def upload_achievement(
             errors.append({"filename": file.filename, "error": str(e)})
 
     return {"uploaded": results, "errors": errors}
+
+
+class AchievementReidentifyRequest(BaseModel):
+    ids: Optional[List[int]] = None  # 为空表示全量重跑
+
+
+@app.post("/achievements/reidentify", summary="批量重新识别成果（后台重新提取证书申请日期等字段）")
+def reidentify_achievements(req: AchievementReidentifyRequest, db: Session = Depends(get_db)):
+    """遍历已有成果，对有磁盘文件的记录后台重新提取文本+LLM识别，重点回填「申请日期」。"""
+    q = db.query(Achievement)
+    if req.ids:
+        q = q.filter(Achievement.id.in_(req.ids))
+    items = q.all()
+
+    tasks = []   # (id, file_path, file_name)
+    skipped = []  # 无文件或文件不存在，无法重识别
+    for a in items:
+        if not a.file_path or not os.path.exists(a.file_path):
+            skipped.append(a.id)
+            continue
+        a.processing_status = "processing"
+        tasks.append((a.id, a.file_path, a.file_name or ""))
+    db.commit()  # 先持久化 processing 状态，再提交后台任务，避免竞态
+
+    for aid, fpath, fname in tasks:
+        _ocr_executor.submit(_reidentify_achievement_async, aid, fpath, fname)
+
+    _audit("admin", "POST /achievements/reidentify",
+           f"批量重新识别 {len(tasks)} 条成果（跳过 {len(skipped)} 条无文件）")
+    return {"triggered": len(tasks), "skipped": skipped, "count": len(tasks)}
 
 
 @app.put("/achievements/{achievement_id}", summary="编辑成果（自由修正识别结果）")
