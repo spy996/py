@@ -3021,11 +3021,11 @@ elif menu == "🏆 成果台账":
             })
         df = pd.DataFrame(rows)
 
-        # 筛选结果计数 + 下载 Excel 按钮（同一行）
-        cap_c, dl_c = st.columns([3, 1])
+        # 筛选结果计数 + 下载 Excel + 下载附件按钮（同一行）
+        cap_c, b_excel, b_attach = st.columns([3, 1, 1])
         with cap_c:
             st.caption(f"筛选结果 {len(filtered)} / 共 {len(items)} 条")
-        with dl_c:
+        with b_excel:
             import io
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -3037,6 +3037,14 @@ elif menu == "🏆 成果台账":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="ach_download_excel",
             )
+        with b_attach:
+            attach_ids = [str(a["id"]) for a in filtered if a.get("download_url")]
+            tok = st.session_state.get("token", "")
+            if attach_ids:
+                attach_url = f"{API_BASE}/achievements/export-attachments?ids={','.join(attach_ids)}&token={tok}"
+                st.link_button("📦 下载附件", attach_url)
+            else:
+                st.button("📦 下载附件", disabled=True)
 
         st.dataframe(df, use_container_width=True, hide_index=True)
 

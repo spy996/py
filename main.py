@@ -4748,6 +4748,47 @@ def update_achievement(achievement_id: int, req: AchievementUpdate, db: Session 
     return _achievement_to_dict(a, pmap.get(a.project_id, ""))
 
 
+@app.get("/achievements/export-attachments", summary="一键打包下载成果附件（筛选结果）")
+def export_achievement_attachments(ids: str, db: Session = Depends(get_db)):
+    """把指定成果 id（逗号分隔）的附件文件打包成 zip 下载，供前端「筛选结果」一键下载附件。"""
+    try:
+        id_list = [int(x) for x in ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="参数 ids 格式错误")
+    if not id_list:
+        raise HTTPException(status_code=400, detail="未选择要下载的成果")
+
+    items = db.query(Achievement).filter(Achievement.id.in_(id_list)).all()
+    buf = io.BytesIO()
+    used_names = {}
+    added = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for a in items:
+            if not a.file_path or not os.path.exists(a.file_path):
+                continue
+            # 附件名优先 file_name，回退「成果名_编号」；同名自动加序号，避免 zip 内相互覆盖
+            name = a.file_name or f"{a.name or '成果'}_{a.id}"
+            if name in used_names:
+                used_names[name] += 1
+                base, ext = os.path.splitext(name)
+                name = f"{base}_{used_names[name]}{ext}"
+            else:
+                used_names[name] = 0
+            zf.write(a.file_path, arcname=name)
+            added += 1
+
+    if added == 0:
+        raise HTTPException(status_code=404, detail="筛选结果中没有可下载的附件")
+
+    zip_name = f"成果附件_{added}个.zip"
+    disposition = f"attachment; filename*=UTF-8''{quote(zip_name)}"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": disposition},
+    )
+
+
 @app.get("/achievements/{achievement_id}/download", summary="下载成果文件")
 def download_achievement_file(achievement_id: int, db: Session = Depends(get_db)):
     a = db.query(Achievement).filter(Achievement.id == achievement_id).first()
