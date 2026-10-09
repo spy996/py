@@ -21,6 +21,8 @@ qq_tmp/
 # ---- 业务/科研资料与文档（含敏感信息）----
 项目管理/
 融合*/
+# 目录级排除（名字以 .ref 结尾的目录，如 .专利清单-按年度分类.ref，内含专利清单抽取文本）
+.专利清单-按年度分类.ref/
 *.pdf
 *.PDF
 *.doc
@@ -42,3 +44,6 @@ migrate_storage.py
 reidentify_achievements_batch.py
 使用说明.md
 启动文档.docx
+requirements.txt
+.gitignore
+README.md

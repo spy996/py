@@ -58,7 +58,9 @@ def copy_tree(src: str, dst: str, dir_pats, file_pats) -> int:
             if d in ALWAYS_SKIP_DIRS:
                 continue
             rel_d = os.path.join(rel_root, d).replace(os.sep, "/") if rel_root else d
-            if _match(dir_pats, d, rel_d):
+            # 目录名同时匹配「目录模式」与「文件模式」：例如目录名以 .ref 结尾
+            # （.专利清单-按年度分类.ref）应命中 file_pats 里的 *.ref，整目录排除。
+            if _match(dir_pats, d, rel_d) or _match(file_pats, d, rel_d):
                 continue
             kept_dirs.append(d)
         dirs[:] = kept_dirs

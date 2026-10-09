@@ -27,7 +27,7 @@ from PIL import Image, ImageDraw
 APP_NAME = "科技项目管理系统"
 BACKEND_PORT = 8000
 FRONTEND_PORT = 8501
-FRONTEND_URL = "http://localhost:%d" % FRONTEND_PORT
+FRONTEND_URL = "http://127.0.0.1:%d" % FRONTEND_PORT
 MUTEX_NAME = "Local\\RDPlatform.%s.Launcher" % APP_NAME
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
@@ -98,8 +98,38 @@ def setup_wizard_path() -> str:
 # ---------------------------------------------------------------------------
 # 单实例互斥
 # ---------------------------------------------------------------------------
+def _pid_alive(pid: int) -> bool:
+    """判断进程是否存活（Windows 用 OpenProcess/GetExitCodeProcess，其他平台 os.kill(0)）。"""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # 87 = ERROR_INVALID_PARAMETER：PID 不存在
+                return ctypes.get_last_error() != 87
+            try:
+                exit_code = wintypes.DWORD(0)
+                k32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True  # 无法判断时保守视为存活
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 class SingleInstance:
-    """Windows 命名互斥量优先；非 Windows 或失败时用锁文件兜底。"""
+    """Windows 命名互斥量优先；非 Windows 或失败时用锁文件兜底（含陈旧锁检测）。"""
 
     def __init__(self, name: str = MUTEX_NAME):
         self._mutex_handle = None
@@ -138,12 +168,43 @@ class SingleInstance:
         try:
             os.makedirs(lock_dir, exist_ok=True)
             self._lock_path = os.path.join(lock_dir, "launcher.lock")
-            self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._lock_fd, str(os.getpid()).encode())
-            return True
-        except FileExistsError:
+            for _ in range(2):
+                try:
+                    self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(self._lock_fd, str(os.getpid()).encode())
+                    return True
+                except FileExistsError:
+                    # 锁已存在：若属主进程已死（陈旧锁），清除后重试一次
+                    if self._clear_stale_lock():
+                        continue
+                    return False
             return False
         except Exception:  # noqa: BLE001
+            return False
+
+    def _clear_stale_lock(self) -> bool:
+        """锁文件存在但属主进程已死时清除锁文件；返回是否已清除。"""
+        pid = 0
+        try:
+            with open(self._lock_path, "r", encoding="utf-8") as f:
+                pid = int((f.read().strip() or "0"))
+        except Exception:  # noqa: BLE001
+            pid = 0
+        if pid > 0:
+            if _pid_alive(pid):
+                return False  # 属主仍存活，不清理
+        else:
+            # 读不到有效 PID：用 mtime 兜底，锁文件过老（>60s）视为陈旧
+            try:
+                if time.time() - os.path.getmtime(self._lock_path) < 60:
+                    return False
+            except OSError:
+                return False
+        try:
+            os.remove(self._lock_path)
+            log("[单实例] 已清除陈旧锁文件：%s" % self._lock_path)
+            return True
+        except OSError:
             return False
 
     def release(self) -> None:
@@ -370,21 +431,6 @@ def main() -> int:
     mgr = ServiceManager(data_dir)
     state = {"services_running": False}
 
-    def start_services():
-        try:
-            mgr.start_backend()
-            mgr.start_frontend()
-            backend_ok = _port_ready(BACKEND_PORT)
-            frontend_ok = _port_ready(FRONTEND_PORT)
-            if backend_ok and frontend_ok:
-                state["services_running"] = True
-                log("[就绪] 后端与前端均已启动，打开浏览器。")
-                webbrowser.open(FRONTEND_URL)
-            else:
-                log("[警告] 服务就绪探测超时（backend=%s, frontend=%s）。" % (backend_ok, frontend_ok))
-        except Exception as e:  # noqa: BLE001
-            log("[错误] 启动服务失败：%s" % e)
-
     def on_open():
         webbrowser.open(FRONTEND_URL)
 
@@ -400,6 +446,31 @@ def main() -> int:
         icon.stop()
 
     icon = build_tray(on_open, on_stop, on_quit)
+
+    def notify_user(title, message):
+        """托盘气泡提示（服务启动异常时给用户可见反馈）。"""
+        try:
+            icon.notify(message, title=title)
+        except Exception as e:  # noqa: BLE001
+            log("[通知失败] %s" % e)
+
+    def start_services():
+        try:
+            mgr.start_backend()
+            mgr.start_frontend()
+            backend_ok = _port_ready(BACKEND_PORT)
+            frontend_ok = _port_ready(FRONTEND_PORT)
+            if backend_ok and frontend_ok:
+                state["services_running"] = True
+                log("[就绪] 后端与前端均已启动，打开浏览器。")
+                webbrowser.open(FRONTEND_URL)
+            else:
+                log("[警告] 服务就绪探测超时（backend=%s, frontend=%s）。" % (backend_ok, frontend_ok))
+                notify_user(APP_NAME, "服务启动超时，请查看日志：%s" % os.path.join(data_dir, "logs"))
+        except Exception as e:  # noqa: BLE001
+            log("[错误] 启动服务失败：%s" % e)
+            notify_user(APP_NAME, "服务启动失败：%s" % e)
+
     log("[启动] 开始拉起服务...")
     threading.Thread(target=start_services, daemon=True).start()
     icon.run()
