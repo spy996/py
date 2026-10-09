@@ -14,6 +14,7 @@ import re
 
 from constants import PROJECT_STAGES
 from ui_common import fmt_money, time_filter_widget, stage_progress
+from config import DATA_DIR
 
 
 # ★★★ 让 requests 绕过系统代理，直接访问本机后端 ★★★
@@ -26,8 +27,8 @@ requests.put = _session.put
 requests.delete = _session.delete
 
 # ============ 基础配置 ============
-API_BASE = "http://127.0.0.1:8000"
-CHAT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+CHAT_HISTORY_FILE = os.path.join(DATA_DIR, "chat_history.json")
 
 st.set_page_config(
     page_title="研发知识智能管理平台",

@@ -40,14 +40,8 @@ import security
 import io
 from concurrent.futures import ThreadPoolExecutor
 
-import cv2
-import numpy as np
-import fitz  # PyMuPDF
-from rapidocr_onnxruntime import RapidOCR
-from openpyxl import load_workbook
-
-
 # OCR 后台线程池：专门跑扫描件 OCR / 合同 / 财务 / 成果 等异步识别，避免上传阻塞
+# （OCR 引擎实现在 utils/text_extract.py，此处不再重复导入 cv2/numpy/fitz/RapidOCR/openpyxl）
 _ocr_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr-bg")
 
 

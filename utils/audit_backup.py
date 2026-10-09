@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 from cryptography.fernet import Fernet
 
-from config import BASE_DIR, ENV, UPLOAD_DIR, logger, _append_env
+from config import DATA_DIR, DB_PATH, ENV, UPLOAD_DIR, logger, _append_env
 from database import SessionLocal
 from models import AuditLog
 
@@ -30,7 +30,7 @@ def _audit(username: str, action: str, detail: str = "", ip: str = ""):
 
 
 # ============ 自动备份（加密） ============
-BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 try:
     BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", ENV.get("BACKUP_KEEP", "10")) or 10)
@@ -51,7 +51,7 @@ _fernet = Fernet(BACKUP_KEY_RAW.encode())
 
 
 # ============ 审计日志归档 ============
-AUDIT_ARCHIVE_DIR = os.path.join(BASE_DIR, "audit_archive")
+AUDIT_ARCHIVE_DIR = os.path.join(DATA_DIR, "audit_archive")
 os.makedirs(AUDIT_ARCHIVE_DIR, exist_ok=True)
 try:
     AUDIT_RETENTION_DAYS = int(os.getenv("AUDIT_RETENTION_DAYS", ENV.get("AUDIT_RETENTION_DAYS", "90")) or 90)
@@ -76,7 +76,7 @@ def _do_backup() -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     enc_path = os.path.join(BACKUP_DIR, f"backup_{ts}.zip.enc")
     tmp_zip = os.path.join(BACKUP_DIR, f".tmp_{ts}.zip")
-    db_path = os.path.join(BASE_DIR, "rd_platform.db")
+    db_path = DB_PATH
 
     def _add_dir(zf, root_dir, arc_prefix):
         if not os.path.isdir(root_dir):

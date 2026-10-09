@@ -1,0 +1,44 @@
+# ============================================================
+# 打包排除清单（build_copy.py 读取；相对项目根目录）
+# 规则：
+#   - 以 / 结尾  → 排除同名目录及其全部内容（支持 fnmatch 通配，如 融合*/）
+#   - 否则       → 排除匹配的文件（支持 fnmatch 通配，按文件名或相对路径匹配）
+# ============================================================
+
+# ---- 现有业务数据（严禁打包：数据库/密钥/附件/日志/聊天记录）----
+rd_platform.db
+.env
+.env.example
+data/
+uploads/
+backups/
+audit_archive/
+chat_history.json
+*.log
+*.log.*
+qq_tmp/
+
+# ---- 业务/科研资料与文档（含敏感信息）----
+项目管理/
+融合*/
+*.pdf
+*.PDF
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.png
+*.jpg
+*.jpeg
+*.zip
+*.ref
+*.gw
+
+# ---- 单机版剥离的组件与运维脚本（不随安装包发布）----
+qq_bot.py
+install.bat
+start_all.bat
+migrate_storage.py
+reidentify_achievements_batch.py
+使用说明.md
+启动文档.docx
