@@ -16,6 +16,7 @@ class Project(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     stage = Column(String(20), nullable=True)  # 当前阶段（项目立项/项目投决/项目实施/项目验收）
+    start_year = Column(Integer, nullable=True, index=True)  # 立项年份（如 2026；空=未标注）
     created_at = Column(DateTime, default=datetime.utcnow)
 
     files = relationship("ProjectFile", back_populates="project", cascade="all, delete-orphan")
@@ -423,6 +424,10 @@ if "projects" in _inspector.get_table_names():
         with engine.begin() as _conn:
             _conn.execute(text("ALTER TABLE projects ADD COLUMN stage VARCHAR(20)"))
         print("[迁移] 已为 projects 表添加 stage 列")
+    if "start_year" not in _pcols:
+        with engine.begin() as _conn:
+            _conn.execute(text("ALTER TABLE projects ADD COLUMN start_year INTEGER"))
+        print("[迁移] 已为 projects 表添加 start_year 列")
 
 # 初始化系统默认配置（待定口径可配置项，INSERT OR IGNORE 幂等）
 _DEFAULT_CONFIGS = {

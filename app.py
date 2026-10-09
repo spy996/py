@@ -88,7 +88,17 @@ st.markdown(
             box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
         }
         [data-testid="stMetric"] label { color: var(--muted); font-size: 0.84rem; }
-        [data-testid="stMetricValue"] { color: var(--brand-dark); font-weight: 700; }
+        /* 金额等长指标值：完整显示，不截断、不显示省略号（窄列自动缩小字号 / 换行） */
+        [data-testid="stMetricValue"] {
+            color: var(--brand-dark);
+            font-weight: 700;
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+            overflow-wrap: anywhere;
+            line-height: 1.2;
+            font-size: clamp(0.95rem, 1.3vw, 1.75rem);
+        }
         /* 折叠区更精致 */
         div[data-testid="stExpander"] details {
             border: 1px solid var(--border);
@@ -491,10 +501,10 @@ def api_dashboard():
 
 
 # ============ 辅助函数 ============
-def api_create_project(code, name, description, stage="项目立项"):
+def api_create_project(code, name, description, stage="项目立项", start_year=None):
     resp = requests.post(
         f"{API_BASE}/projects",
-        json={"code": code, "name": name, "description": description, "stage": stage},
+        json={"code": code, "name": name, "description": description, "stage": stage, "start_year": start_year},
     )
     return resp
 
@@ -1797,22 +1807,48 @@ if menu == "🏠 项目列表":
     st.header("项目列表")
     projects = api_list_projects()
 
-    # ===== 项目概览框（名字 + 编号 + 描述）=====
+    # ===== 项目概览框（名字 + 编号 + 描述，按年份折叠）=====
     st.subheader("📌 项目概览")
-    with st.container(border=True):
-        if not projects:
-            st.write("（还没有项目）")
-        else:
-            for i, p in enumerate(projects, 1):
-                pcode = p.get("code", "")
-                pdesc = p.get("description", "") or "（无描述）"
-                c1, c2, c3 = st.columns([6.5, 1.2, 1])
-                c1.write(f"{i}. 📁 {p['name']} ｜ 编号：{pcode} ｜ 描述：{pdesc}")
-                if c2.button("📂 进入", key=f"enter_{p['id']}", help=f"进入项目「{p['name']}」"):
-                    st.session_state["_nav_target"] = ("📁 文件管理", p["id"])
-                    st.rerun()
-                if c3.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
-                    st.session_state["confirm_del_project"] = p["id"]
+    if not projects:
+        st.info("（还没有项目）")
+    else:
+        # 项目年份：直接用「立项年份」字段，空值/非法值归入「未标注年份」
+        def _proj_year(p):
+            try:
+                y = int(p.get("start_year"))
+                return str(y) if y else "未标注年份"
+            except (TypeError, ValueError):
+                return "未标注年份"
+
+        _groups = {}
+        for _p in projects:
+            _groups.setdefault(_proj_year(_p), []).append(_p)
+
+        # 年份降序；「未标注年份」排最后
+        _years = sorted((y for y in _groups if y != "未标注年份"), key=lambda y: -int(y))
+        if "未标注年份" in _groups:
+            _years.append("未标注年份")
+
+        with st.container(border=True):
+            for _yi, _year in enumerate(_years):
+                _items = _groups[_year]
+                _title = (
+                    f"{_year} 年（{len(_items)} 个项目）"
+                    if _year != "未标注年份"
+                    else f"未标注年份（{len(_items)} 个项目）"
+                )
+                # 最新年份默认展开，其余折叠
+                with st.expander(_title, expanded=(_yi == 0)):
+                    for _i, p in enumerate(_items, 1):
+                        pcode = p.get("code", "")
+                        pdesc = p.get("description", "") or "（无描述）"
+                        c1, c2, c3 = st.columns([6.5, 1.2, 1])
+                        c1.write(f"{_i}. 📁 {p['name']} ｜ 编号：{pcode} ｜ 描述：{pdesc}")
+                        if c2.button("📂 进入", key=f"enter_{p['id']}", help=f"进入项目「{p['name']}」"):
+                            st.session_state["_nav_target"] = ("📁 文件管理", p["id"])
+                            st.rerun()
+                        if c3.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
+                            st.session_state["confirm_del_project"] = p["id"]
 
     # 二次确认：点击上面的"删除"后，这里会出现确认/取消按钮
     if "confirm_del_project" in st.session_state and st.session_state["confirm_del_project"] is not None:
@@ -1846,13 +1882,22 @@ elif menu == "➕ 创建项目":
         name = st.text_input("项目名称（必填）", placeholder="例如：科技项目名称")
         description = st.text_area("项目描述（可选）", placeholder="简单介绍一下这个项目……")
         stage = st.selectbox("项目阶段", PROJECT_STAGES, index=0)
+        start_year = st.number_input(
+            "立项年份（可选，不填 = 未标注）",
+            min_value=1990,
+            max_value=2100,
+            value=None,
+            step=1,
+            placeholder="例如 2026",
+        )
         submitted = st.form_submit_button("✅ 创建项目")
 
     if submitted:
         if not code or not name:
             st.error("项目编号和项目名称是必填的！")
         else:
-            resp = api_create_project(code, name, description, stage)
+            _sy = int(start_year) if start_year is not None else None
+            resp = api_create_project(code, name, description, stage, _sy)
             if resp.status_code == 200:
                 st.success(f"项目「{name}」创建成功！")
             else:
@@ -2138,13 +2183,34 @@ elif menu == "📌 项目管理":
             _files_by_stage = d.get("files_by_stage", [])
 
             # ① 信息卡
+            _sy = _proj.get("start_year")
+            _sy_text = f"{int(_sy)} 年" if _sy else "未标注"
             with st.container(border=True):
                 st.markdown(f"### 📁 {_proj.get('name', '')}")
                 st.caption(
                     f"编号：{_proj.get('code', '')}　｜　当前阶段：{_proj.get('stage', '项目立项')}"
-                    f"　｜　创建于 {_proj.get('created_at', '')}"
+                    f"　｜　立项年份：{_sy_text}　｜　创建于 {_proj.get('created_at', '')}"
                 )
                 st.write(_proj.get("description") or "（无描述）")
+
+                # 补录/修改立项年份（存量项目可在此补录）
+                with st.expander("✏️ 修改立项年份", expanded=False):
+                    from datetime import datetime as _dtm
+                    _year_choices = ["未标注"] + [str(y) for y in range(_dtm.now().year + 1, 1989, -1)]
+                    _cur_sy = str(int(_sy)) if _sy else "未标注"
+                    _default_idx = _year_choices.index(_cur_sy) if _cur_sy in _year_choices else 0
+                    _sy_new = st.selectbox(
+                        "立项年份", _year_choices, index=_default_idx,
+                        key=f"pm_start_year_{project_id}",
+                    )
+                    if st.button("💾 保存年份", key=f"pm_save_year_{project_id}"):
+                        _sy_val = None if _sy_new == "未标注" else int(_sy_new)
+                        _resp = api_update_project(project_id, {"start_year": _sy_val})
+                        if _resp is not None and _resp.status_code == 200:
+                            st.success("立项年份已保存")
+                            st.rerun()
+                        else:
+                            st.error("保存失败，请重试")
 
             # ② 6 指标
             _m1, _m2, _m3, _m4, _m5, _m6 = st.columns(6)

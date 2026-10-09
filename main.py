@@ -331,6 +331,7 @@ class ProjectCreate(BaseModel):
     name: str
     description: Optional[str] = None
     stage: Optional[str] = "项目立项"
+    start_year: Optional[int] = None  # 立项年份（空=未标注）
 
 class AskRequest(BaseModel):
     question: str
@@ -352,6 +353,7 @@ class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     stage: Optional[str] = None
+    start_year: Optional[int] = None
 
 
 @app.post("/projects", summary="创建项目")
@@ -366,6 +368,7 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
         name=project.name,
         description=project.description,
         stage=stage,
+        start_year=project.start_year,
     )
     db.add(db_project)
     db.commit()
@@ -398,6 +401,8 @@ def update_project(project_id: int, project: ProjectUpdate, db: Session = Depend
         db_project.description = project.description
     if project.stage is not None:
         db_project.stage = project.stage if project.stage in PROJECT_STAGES else "项目立项"
+    if project.start_year is not None:
+        db_project.start_year = project.start_year
 
     db.commit()
     db.refresh(db_project)
@@ -455,6 +460,7 @@ def project_dashboard(project_id: int, db: Session = Depends(get_db)):
             "name": project.name,
             "description": project.description or "",
             "stage": project.stage or "项目立项",
+            "start_year": project.start_year,
             "created_at": project.created_at.strftime("%Y-%m-%d %H:%M:%S") if project.created_at else "",
         },
         "metrics": {
