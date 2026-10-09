@@ -1702,7 +1702,14 @@ if not st.session_state.get("token"):
                 else:
                     resp = api_login(username, password)
                     if resp is None:
-                        st.error("无法连接后端服务，请先运行 start_all.bat 启动后端。")
+                        logs_dir = os.path.join(DATA_DIR, "logs")
+                        st.error(
+                            "无法连接后端服务（后端尚未就绪或已停止）。\n\n"
+                            "请先检查系统托盘右下角的「科技项目管理系统」图标："
+                            "点击「打开界面」或「退出」后重新启动程序。\n\n"
+                            f"若仍无法连接，请打开日志目录查看后端启动错误：\n`{logs_dir}`"
+                            "（重点看 `backend.log` 尾部的报错信息）。"
+                        )
                     elif resp.status_code == 200:
                         data = resp.json()
                         st.session_state["token"] = data["token"]

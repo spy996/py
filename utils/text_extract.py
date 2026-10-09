@@ -7,13 +7,47 @@ import io
 import logging
 import threading
 
-import cv2
-import numpy as np
-import fitz  # PyMuPDF
-from rapidocr_onnxruntime import RapidOCR
-from openpyxl import load_workbook
+# 可选原生依赖：逐个 try/except 保护。任一缺失都不会让后端启动崩溃，
+# 仅使对应能力降级（PDF 文字层 / Excel 仍可用，扫描件与图片 OCR 不可用）。
+_import_errors = []
+
+try:
+    import fitz  # PyMuPDF：PDF 文字层提取
+except Exception as _e:  # noqa: BLE001
+    fitz = None
+    _import_errors.append("PyMuPDF(fitz)：%s" % _e)
+
+try:
+    import cv2
+except Exception as _e:  # noqa: BLE001
+    cv2 = None
+    _import_errors.append("cv2(OpenCV)：%s" % _e)
+
+try:
+    import numpy as np
+except Exception as _e:  # noqa: BLE001
+    np = None
+    _import_errors.append("numpy：%s" % _e)
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception as _e:  # noqa: BLE001
+    RapidOCR = None
+    _import_errors.append("rapidocr_onnxruntime(RapidOCR)：%s" % _e)
+
+try:
+    from openpyxl import load_workbook
+except Exception as _e:  # noqa: BLE001
+    load_workbook = None
+    _import_errors.append("openpyxl：%s" % _e)
 
 logger = logging.getLogger("rd_platform")
+
+# 扫描件/图片 OCR 是否完整可用（cv2 + numpy + RapidOCR 三者齐全）
+_OCR_AVAILABLE = (cv2 is not None and np is not None and RapidOCR is not None)
+
+if _import_errors:
+    logger.warning("[OCR] 部分文档解析依赖未能加载，相关功能将降级：%s", "; ".join(_import_errors))
 
 # OCR 引擎懒加载：首次真正用到 OCR 时才初始化（模型加载很慢，避免拖慢后端启动）
 _ocr_engine = None
@@ -23,6 +57,8 @@ _ocr_init_lock = threading.Lock()
 def _get_ocr_engine():
     """按需初始化并返回全局 OCR 引擎（双重检查锁，线程安全）。"""
     global _ocr_engine
+    if RapidOCR is None:
+        raise RuntimeError("OCR 引擎组件未安装（rapidocr_onnxruntime 缺失）")
     if _ocr_engine is None:
         with _ocr_init_lock:
             if _ocr_engine is None:
@@ -36,6 +72,8 @@ _ocr_lock = threading.Lock()
 # ============ 文本提取工具 ============
 def _extract_text_from_pdf(file_bytes: bytes) -> str:
     """PDF 提取：优先文字层，扫描页走 OCR"""
+    if fitz is None:
+        return "（PDF 解析组件未安装，无法提取 PDF 内容）"
     parts = []
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -75,6 +113,8 @@ def _extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def _pdf_needs_ocr(file_path: str, sample_pages: int = 5, text_threshold: int = 30) -> bool:
     """判断 PDF 是否为纯扫描件（抽样前几页均几乎无文字层 → 需要后台 OCR，避免上传阻塞）。"""
+    if fitz is None:
+        return False
     try:
         doc = fitz.open(file_path)
         try:
@@ -93,6 +133,8 @@ def _pdf_needs_ocr(file_path: str, sample_pages: int = 5, text_threshold: int = 
 
 def _extract_text_from_excel(file_bytes: bytes) -> str:
     """从 .xlsx / .xlsm 提取所有单元格文字，按行拼接。"""
+    if load_workbook is None:
+        return "（Excel 解析组件未安装，无法提取 Excel 内容）"
     try:
         wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
     except Exception:
@@ -251,6 +293,8 @@ def _preprocess_for_ocr(img):
 
 def _extract_text_from_image(file_bytes: bytes) -> str:
     """用 OCR 提取图片（截图/照片/扫描图）中的文字（含预处理，对发票/单据照片更稳）。"""
+    if not _OCR_AVAILABLE:
+        return "（OCR 组件未安装，无法识别图片文字）"
     # 直接从内存中的图片字节解码成图像（BGR 格式，是 OCR 引擎需要的格式）
     img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:

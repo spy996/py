@@ -403,6 +403,16 @@ def build_tray(on_open, on_stop, on_quit):
     return icon
 
 
+def _tail_file(path: str, n: int = 20) -> str:
+    """读取文件末尾 n 行（用于把后端启动报错透传给用户）。失败返回空串。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:]).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -466,7 +476,12 @@ def main() -> int:
                 webbrowser.open(FRONTEND_URL)
             else:
                 log("[警告] 服务就绪探测超时（backend=%s, frontend=%s）。" % (backend_ok, frontend_ok))
-                notify_user(APP_NAME, "服务启动超时，请查看日志：%s" % os.path.join(data_dir, "logs"))
+                log_dir = os.path.join(data_dir, "logs")
+                tail = _tail_file(os.path.join(log_dir, "backend.log"))
+                msg = "服务启动超时，请查看日志：%s" % log_dir
+                if tail:
+                    msg += "\n\n后端启动日志（末尾）：\n%s" % tail
+                notify_user(APP_NAME, msg)
         except Exception as e:  # noqa: BLE001
             log("[错误] 启动服务失败：%s" % e)
             notify_user(APP_NAME, "服务启动失败：%s" % e)
