@@ -47,3 +47,9 @@ chat_history.json
 *.jpeg
 *.ref
 *.gw
+
+# 打包构建产物（不提交：便携运行时/暂存目录/安装器/最终安装包）
+packaging/build/
+packaging/dist/
+packaging/runtime/
+packaging/*.exe
