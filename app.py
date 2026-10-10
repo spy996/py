@@ -3526,6 +3526,7 @@ elif menu == "📊 数据大屏":
             ac = d.get("achievement_by_category", {})
             if ac:
                 st.markdown("**成果类型分布**")
+                st.caption("仅统计已授权/已发表/已登记/已获奖/已发布等最终成果，不含在研过程文件")
                 st.bar_chart(ac)
             pfc = d.get("project_file_count", {})
             if pfc:

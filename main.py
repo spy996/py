@@ -5122,10 +5122,13 @@ def dashboard(db: Session = Depends(get_db)):
         if status == "已超期":
             overdue_count += 1
 
-    # 成果分类分布：GROUP BY 聚合
+    # 成果分类分布：只统计「最终成果」（已授权/已发表/已登记/已获奖/已发布），
+    # 排除过程文件（在研）及空状态，避免把未定型的中间成果计入大屏分布。
+    _final_statuses = {"已授权", "已发表", "已登记", "已获奖", "已发布"}
     achievement_by_category = {
         (k or "其他"): v
         for k, v in db.query(Achievement.category, func.count(Achievement.id))
+        .filter(Achievement.status.in_(_final_statuses))
         .group_by(Achievement.category).all()
     }
 
