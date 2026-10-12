@@ -1940,10 +1940,11 @@ elif menu == "📁 文件管理":
         st.warning("请先创建项目，再上传文件。")
     else:
         project_options = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in projects}
-        option_labels = list(project_options.keys())
-        # 默认选中：优先使用"从项目列表跳转"带过来的项目
+        _placeholder = "（请选择项目）"
+        option_labels = [_placeholder] + list(project_options.keys())
+        # 默认选中：优先使用"从项目列表跳转"带过来的项目；否则处于"未选择"状态
         if "file_project_select" not in st.session_state:
-            default_label = option_labels[0]
+            default_label = _placeholder
             cpid = st.session_state.get("current_project_id")
             if cpid:
                 for label, pid in project_options.items():
@@ -1952,6 +1953,9 @@ elif menu == "📁 文件管理":
                         break
             st.session_state.file_project_select = default_label
         selected = st.selectbox("选择项目", option_labels, key="file_project_select")
+        if selected == _placeholder:
+            st.info("请先在上方选择一个项目，查看该项目的文件列表。")
+            st.stop()
         project_id = project_options[selected]
 
         files = api_list_files(project_id)
@@ -1985,6 +1989,12 @@ elif menu == "📁 文件管理":
         if not files:
             st.info("该项目还没有文件。")
         else:
+            # ---- 文件列表概览（折叠，只显示文件名 + 文件类型）----
+            with st.expander(f"📋 文件列表概览（{len(files)} 个文件）", expanded=False):
+                for _f in files:
+                    _fname = _f.get("original_name") or "未命名"
+                    _ftype = _f.get("doc_type") or _f.get("category") or "未分类"
+                    st.markdown(f"- **{_fname}** ｜ 类型：{_ftype}")
             # ---- 搜索框：按文件名 / 分类 / 类型 / 阶段 / 简述模糊匹配 ----
             search_kw = st.text_input(
                 "🔍 搜索文件",

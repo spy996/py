@@ -53,3 +53,6 @@ packaging/build/
 packaging/dist/
 packaging/runtime/
 packaging/*.exe
+
+# 文档编排中间产物（tencent-docx pipeline 输出）
+output/
