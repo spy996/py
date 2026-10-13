@@ -1842,13 +1842,72 @@ if menu == "🏠 项目列表":
                     for _i, p in enumerate(_items, 1):
                         pcode = p.get("code", "")
                         pdesc = p.get("description", "") or "（无描述）"
-                        c1, c2, c3 = st.columns([6.5, 1.2, 1])
+                        c1, c2, c3, c4 = st.columns([5.2, 1.1, 1.1, 1.2])
                         c1.write(f"{_i}. 📁 {p['name']} ｜ 编号：{pcode} ｜ 描述：{pdesc}")
                         if c2.button("📂 进入", key=f"enter_{p['id']}", help=f"进入项目「{p['name']}」"):
                             st.session_state["_nav_target"] = ("📁 文件管理", p["id"])
                             st.rerun()
-                        if c3.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
+                        if c3.button("✏️ 编辑", key=f"editbtn_{p['id']}", help=f"编辑项目「{p['name']}」"):
+                            st.session_state["edit_project_id"] = p["id"]
+                            st.rerun()
+                        if c4.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
                             st.session_state["confirm_del_project"] = p["id"]
+
+    # 编辑项目表单：点击上面某个项目的「✏️ 编辑」后，这里会出现编辑表单
+    if st.session_state.get("edit_project_id") is not None:
+        eid = st.session_state["edit_project_id"]
+        target = next((p for p in projects if p["id"] == eid), None)
+        if target is None:
+            st.session_state["edit_project_id"] = None
+        else:
+            st.divider()
+            st.subheader(f"✏️ 编辑项目：{target['name']}")
+            with st.form(f"edit_project_form_{eid}"):
+                ncode = st.text_input("项目编号（必填，唯一）", value=target.get("code") or "")
+                nname = st.text_input("项目名称（必填）", value=target.get("name") or "")
+                ndesc = st.text_area("项目描述（可选，留空即清空）", value=target.get("description") or "")
+                _cur_stage = target.get("stage") or "项目立项"
+                _stage_idx = PROJECT_STAGES.index(_cur_stage) if _cur_stage in PROJECT_STAGES else 0
+                nstage = st.selectbox("项目阶段", PROJECT_STAGES, index=_stage_idx)
+                _cur_year = target.get("start_year")
+                try:
+                    _cur_year_int = int(_cur_year) if _cur_year not in (None, "") else None
+                except (TypeError, ValueError):
+                    _cur_year_int = None
+                clear_year = st.checkbox("清空立项年份（设为「未标注年份」）", value=False)
+                nyear = st.number_input(
+                    "立项年份", min_value=1990, max_value=2100,
+                    value=_cur_year_int, step=1, disabled=clear_year,
+                )
+                submitted = st.form_submit_button("💾 保存修改")
+
+            if submitted:
+                if not (ncode or "").strip() or not (nname or "").strip():
+                    st.error("项目编号和项目名称是必填的！")
+                else:
+                    _payload = {
+                        "code": (ncode or "").strip(),
+                        "name": (nname or "").strip(),
+                        "description": ndesc,
+                        "stage": nstage,
+                        "start_year": None if clear_year else (int(nyear) if nyear else None),
+                    }
+                    resp = api_update_project(eid, _payload)
+                    if resp is None:
+                        st.error("无法连接后端")
+                    elif resp.status_code == 200:
+                        st.success("项目已更新")
+                        st.session_state["edit_project_id"] = None
+                        st.rerun()
+                    else:
+                        try:
+                            st.error(resp.json().get("detail", "更新失败"))
+                        except Exception:
+                            st.error(f"更新失败：{resp.text}")
+
+            if st.button("❌ 取消编辑", key=f"cancel_edit_{eid}"):
+                st.session_state["edit_project_id"] = None
+                st.rerun()
 
     # 二次确认：点击上面的"删除"后，这里会出现确认/取消按钮
     if "confirm_del_project" in st.session_state and st.session_state["confirm_del_project"] is not None:

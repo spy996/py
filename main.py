@@ -350,6 +350,7 @@ class DownloadRequest(BaseModel):
 
 
 class ProjectUpdate(BaseModel):
+    code: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
     stage: Optional[str] = None
@@ -395,14 +396,32 @@ def update_project(project_id: int, project: ProjectUpdate, db: Session = Depend
     if not db_project:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    if project.name is not None:
-        db_project.name = project.name
-    if project.description is not None:
-        db_project.description = project.description
-    if project.stage is not None:
-        db_project.stage = project.stage if project.stage in PROJECT_STAGES else "项目立项"
-    if project.start_year is not None:
-        db_project.start_year = project.start_year
+    # 用 exclude_unset 只处理显式传入的字段，支持把 start_year / description 清空为 None/空
+    data = project.dict(exclude_unset=True)
+
+    if "code" in data:
+        new_code = (data["code"] or "").strip()
+        if not new_code:
+            raise HTTPException(status_code=400, detail="项目编号不能为空")
+        dup = db.query(Project).filter(Project.code == new_code, Project.id != project_id).first()
+        if dup:
+            raise HTTPException(status_code=400, detail=f"项目编号 {new_code} 已被其他项目使用")
+        db_project.code = new_code
+
+    if "name" in data:
+        new_name = (data["name"] or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="项目名称不能为空")
+        db_project.name = new_name
+
+    if "description" in data:
+        db_project.description = data["description"]
+
+    if "stage" in data:
+        db_project.stage = data["stage"] if data["stage"] in PROJECT_STAGES else "项目立项"
+
+    if "start_year" in data:
+        db_project.start_year = data["start_year"]
 
     db.commit()
     db.refresh(db_project)
