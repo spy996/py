@@ -17,6 +17,9 @@ class Project(Base):
     description = Column(String, nullable=True)
     stage = Column(String(20), nullable=True)  # 当前阶段（项目立项/项目投决/项目实施/项目验收）
     start_year = Column(Integer, nullable=True, index=True)  # 立项年份（如 2026；空=未标注）
+    completed = Column(Integer, nullable=True, default=0, index=True)  # 0=进行中 1=已完结（完结后不再产生风险提醒）
+    completed_at = Column(String, nullable=True)       # 完结时间
+    completion_note = Column(Text, nullable=True)      # 完结说明/验收结论
     created_at = Column(DateTime, default=datetime.utcnow)
 
     files = relationship("ProjectFile", back_populates="project", cascade="all, delete-orphan")
@@ -211,17 +214,54 @@ class AuditLog(Base):
 
 
 class Funding(Base):
-    """经费管理：项目经费收支明细（预算/到账/支出），可汇总出结余"""
+    """经费管理：统一经费明细台账（预算 / 到账 / 支出）
+
+    设计说明（v2）：
+    - 一行 = 一条经费明细，年度矩阵是这张表的透视视图，不再单独维护“单元格”作为唯一数据源；
+    - category（经费科目）与 source（经费来源）用于分类查询；
+    - contract_id 可空，关联合同后可追溯“这笔钱花在哪个合同上”；
+    - legacy_cell_id 仅用于旧 funding_cells 数据的一次性迁移幂等。
+    """
     __tablename__ = "fundings"
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, nullable=True, index=True)   # 关联项目，可空=平台级经费
-    item_name = Column(String, nullable=False)   # 经费科目/名称（如"省拨经费""设备费""劳务费"）
+    contract_id = Column(Integer, nullable=True, index=True)  # 关联合同（共享合同场景下与 project_id 一起定位分摊项目）
+    item_name = Column(String, nullable=False)   # 经费科目/名称/摘要
     fund_type = Column(String, nullable=True)    # 类型：预算 / 到账 / 支出
     amount = Column(Float, nullable=False)       # 金额（元）
     fund_date = Column(String, nullable=True)    # 日期（到账/支出日期）
+    year = Column(Integer, nullable=True, index=True)   # 归属年度（由 fund_date 推导，可手工修正）
+    month = Column(Integer, nullable=True)       # 归属月份 1~12（年度矩阵用）
+    category = Column(String(50), nullable=True, index=True)  # 经费科目分类：设备费/材料费/劳务费…
+    source = Column(String(50), nullable=True, index=True)    # 经费来源：国拨/省拨/集团拨款/企业自筹…
+    voucher_no = Column(String(80), nullable=True)            # 凭证号/单据号
+    status = Column(String(10), nullable=True, default="已确认")  # 已确认 / 待确认
     remark = Column(String, nullable=True)       # 备注
+    legacy_cell_id = Column(Integer, nullable=True, unique=True, index=True)  # 旧年度一览表单元格 id（迁移幂等）
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ContractProjectShare(Base):
+    """合同-项目分摊：一个合同可被多个项目共用，每个项目只计自己的分摊额，避免合同金额被重复计算。
+
+    - 未配置分摊行时，合同金额 100% 归属合同的主项目（Contract.project_id），兼容历史数据；
+    - 配置分摊行后，各项目按 amount 计；未分完的余额自动归主项目（前端会提示“未分摊余额”）；
+    - ratio 仅作辅助展示，实际金额以 amount 为准；amount 为空时按 ratio × 合同含税金额计算。
+    """
+    __tablename__ = "contract_project_shares"
+    __table_args__ = (UniqueConstraint("contract_id", "project_id", name="uq_contract_share_cp"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    contract_id = Column(Integer, nullable=False, index=True)
+    project_id = Column(Integer, nullable=False, index=True)
+    amount = Column(Float, nullable=True)       # 该项目分摊金额（元）
+    ratio = Column(Float, nullable=True)        # 分摊比例（0~1，辅助）
+    remark = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
 
 class FundingGridRow(Base):
@@ -250,10 +290,11 @@ class FundingCell(Base):
 
 
 class FundingAttachment(Base):
-    """年度经费一览表·附件：精确关联到 项目 + 月份 维度"""
+    """经费附件：优先精确关联到经费明细（funding_id）；旧数据仍按 项目+月份 关联。"""
     __tablename__ = "funding_attachments"
 
     id = Column(Integer, primary_key=True, index=True)
+    funding_id = Column(Integer, nullable=True, index=True)  # 关联 fundings.id（新明细附件）
     year = Column(Integer, nullable=False, index=True)
     project_id = Column(Integer, nullable=False, index=True)
     month = Column(Integer, nullable=False)
@@ -305,6 +346,264 @@ class AlertDismissed(Base):
     category = Column(String(30), nullable=True)
     dismissed_at = Column(DateTime, default=datetime.utcnow)
     operator = Column(String, nullable=True, default="admin")
+
+
+# ============ 网络通讯台账（net_*）：站点 / 定级系统 / 设备 / IP-MAC / 拓扑 / 等保资料 ============
+class NetSite(Base):
+    """站点/管理节点：集控中心、各电站、开关站"""
+    __tablename__ = "net_sites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(30), unique=True, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    company = Column(String(50), nullable=True)      # 木里河 / 唐央 / 木里新能
+    site_type = Column(String(20), nullable=True)    # 水电站/光伏电站/风电场/开关站/集控中心
+    region = Column(String(100), nullable=True)
+    address = Column(String(200), nullable=True)
+    manager = Column(String(50), nullable=True)
+    phone = Column(String(30), nullable=True)
+    sort_order = Column(Integer, default=0)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetSystem(Base):
+    """定级系统（等保对象）"""
+    __tablename__ = "net_systems"
+
+    id = Column(Integer, primary_key=True, index=True)
+    site_id = Column(Integer, ForeignKey("net_sites.id"), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    level_s = Column(String(5), nullable=True)       # S2 / S3
+    level_a = Column(String(5), nullable=True)       # A2 / A3
+    level = Column(String(10), nullable=True)        # 二级 / 三级
+    deploy_zone = Column(String(50), nullable=True)
+    extension = Column(String(50), nullable=True)    # 工业控制系统
+    filing_no = Column(String(60), nullable=True)
+    filing_date = Column(String(20), nullable=True)
+    filing_org = Column(String(100), nullable=True)
+    integrator = Column(String(120), nullable=True)
+    sys_version = Column(String(120), nullable=True)
+    manager = Column(String(50), nullable=True)
+    status = Column(String(20), default="在用")
+    last_eval_date = Column(String(20), nullable=True)
+    last_conclusion = Column(String(20), nullable=True)
+    next_eval_date = Column(String(20), nullable=True)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetDevice(Base):
+    """设备台账：5 大类共用（网络/安全/服务器存储/终端/其他）"""
+    __tablename__ = "net_devices"
+
+    id = Column(Integer, primary_key=True, index=True)
+    site_id = Column(Integer, ForeignKey("net_sites.id"), nullable=False, index=True)
+    system_id = Column(Integer, ForeignKey("net_systems.id"), nullable=True, index=True)
+    category = Column(String(20), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    brand_model = Column(String(200), nullable=True)
+    is_virtual = Column(String(5), default="否")
+    os_version = Column(String(120), nullable=True)
+    purpose = Column(String(200), nullable=True)
+    importance = Column(String(10), default="重要")
+    zone = Column(String(30), nullable=True)
+    room = Column(String(100), nullable=True)
+    mgmt_ip = Column(String(120), nullable=True)
+    mac = Column(String(30), nullable=True)
+    is_hot_standby = Column(String(5), default="否")
+    quantity = Column(Integer, default=1)
+    biz_app = Column(String(200), nullable=True)
+    db_version = Column(String(120), nullable=True)
+    middleware = Column(String(120), nullable=True)
+    antivirus = Column(String(120), nullable=True)
+    asset_no = Column(String(60), nullable=True)
+    sn = Column(String(100), nullable=True)
+    owner = Column(String(50), nullable=True)
+    rack = Column(String(50), nullable=True)
+    warranty_end = Column(String(20), nullable=True)
+    status = Column(String(20), default="在用")
+    source = Column(String(20), default="manual")
+    last_check_at = Column(String(20), nullable=True)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class NetAddress(Base):
+    """IP/MAC 台账：办公终端与固定地址，不管理网段/VLAN/端口"""
+    __tablename__ = "net_addresses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ip = Column(String(40), nullable=True, index=True)
+    mac = Column(String(20), nullable=True, index=True)     # 标准化后
+    mac_raw = Column(String(40), nullable=True)             # 原始文本
+    department = Column(String(60), nullable=True)
+    person = Column(String(40), nullable=True)
+    device_type = Column(String(30), nullable=True)
+    location = Column(String(100), nullable=True)
+    site_id = Column(Integer, ForeignKey("net_sites.id"), nullable=True, index=True)
+    status = Column(String(20), default="在用")
+    wangjian = Column(String(20), nullable=True)            # 已安装/未安装/不适用
+    remark = Column(Text, nullable=True)
+    source = Column(String(20), default="import")
+    first_seen = Column(String(20), nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class NetTopology(Base):
+    """拓扑图：图片 + 缩略图 + 源文件，按版本管理"""
+    __tablename__ = "net_topologies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    site_id = Column(Integer, nullable=True, index=True)
+    system_id = Column(Integer, ForeignKey("net_systems.id"), nullable=True, index=True)
+    name = Column(String(200), nullable=False)
+    kind = Column(String(20), default="网络拓扑图")     # 网络拓扑图/接入点图/总体拓扑
+    version = Column(String(20), nullable=True)
+    effective_date = Column(String(20), nullable=True)
+    image_path = Column(String(500), nullable=False)
+    thumb_path = Column(String(500), nullable=True)
+    source_path = Column(String(500), nullable=True)
+    note = Column(Text, nullable=True)
+    is_current = Column(Integer, default=1)
+    uploaded_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetReport(Base):
+    """等保资料：测评报告/备案证明/整改报告/自查报告"""
+    __tablename__ = "net_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    system_id = Column(Integer, ForeignKey("net_systems.id"), nullable=False, index=True)
+    site_id = Column(Integer, nullable=True, index=True)
+    doc_type = Column(String(20), nullable=False, index=True)
+    report_year = Column(Integer, nullable=True, index=True)
+    project_no = Column(String(40), nullable=True)
+    report_no = Column(String(60), nullable=True)
+    level = Column(String(10), nullable=True)
+    level_s = Column(String(5), nullable=True)
+    level_a = Column(String(5), nullable=True)
+    agency = Column(String(120), nullable=True)
+    eval_start = Column(String(20), nullable=True)
+    eval_end = Column(String(20), nullable=True)
+    report_date = Column(String(20), nullable=True)
+    conclusion = Column(String(20), nullable=True)
+    pass_rate = Column(Float, nullable=True)
+    item_total = Column(Integer, nullable=True)
+    item_pass = Column(Integer, nullable=True)
+    item_partial = Column(Integer, nullable=True)
+    item_fail = Column(Integer, nullable=True)
+    item_na = Column(Integer, nullable=True)
+    problem_count = Column(Integer, nullable=True)
+    major_risk = Column(Integer, default=0)
+    last_eval_date = Column(String(20), nullable=True)
+    last_score = Column(Float, nullable=True)
+    last_conclusion = Column(String(20), nullable=True)
+    next_due = Column(String(20), nullable=True)
+    file_path = Column(String(500), nullable=False)
+    original_name = Column(String(300), nullable=False)
+    file_role = Column(String(10), default="主件")       # 主件/附件
+    size = Column(Integer, nullable=True)
+    text_path = Column(String(500), nullable=True)
+    auto_type = Column(String(20), nullable=True)
+    auto_system = Column(String(200), nullable=True)
+    auto_year = Column(Integer, nullable=True)
+    confidence = Column(Integer, default=0)
+    confirmed = Column(Integer, default=0)
+    remark = Column(Text, nullable=True)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetFinding(Base):
+    """整改项：来自报告 3.14/5.1/8.1/附录B，或手工新增"""
+    __tablename__ = "net_findings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(Integer, ForeignKey("net_reports.id"), nullable=True, index=True)
+    system_id = Column(Integer, index=True, nullable=True)
+    problem_no = Column(Integer, nullable=True)
+    security_class = Column(String(30), nullable=True)
+    control_point = Column(String(30), nullable=True)
+    target = Column(String(300), nullable=True)
+    requirement = Column(Text, nullable=True)
+    description = Column(Text, nullable=False)
+    risk_level = Column(String(10), nullable=True)
+    suggestion = Column(Text, nullable=True)
+    source = Column(String(20), default="report")        # report/prev_year/manual
+    prev_status = Column(String(20), nullable=True)
+    owner = Column(String(50), nullable=True)
+    plan_date = Column(String(20), nullable=True)
+    done_date = Column(String(20), nullable=True)
+    status = Column(String(20), default="待整改")
+    evidence_path = Column(String(500), nullable=True)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetChange(Base):
+    """字段级变更日志（网络台账）"""
+    __tablename__ = "net_changes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entity_type = Column(String(20), nullable=False, index=True)
+    entity_id = Column(Integer, nullable=True)
+    entity_label = Column(String(200), nullable=True)
+    field = Column(String(50), nullable=True)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    reason = Column(String(200), nullable=True)
+    operator = Column(String(50), nullable=True)
+    ts = Column(DateTime, default=datetime.utcnow)
+
+
+class NetImportBatch(Base):
+    """导入批次：保存差异快照，支持回滚"""
+    __tablename__ = "net_import_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String(20), nullable=False)
+    file_name = Column(String(300), nullable=True)
+    total = Column(Integer, default=0)
+    inserted = Column(Integer, default=0)
+    updated = Column(Integer, default=0)
+    skipped = Column(Integer, default=0)
+    detail_json = Column(Text, nullable=True)
+    operator = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class NetDict(Base):
+    """字典：部门/地点/品牌/用途 的别名归一"""
+    __tablename__ = "net_dicts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String(20), nullable=False)
+    name = Column(String(100), nullable=False)
+    alias = Column(String(200), nullable=True)
+    sort_order = Column(Integer, default=0)
+    __table_args__ = (UniqueConstraint("kind", "name", name="uq_net_dict_kind_name"),)
+
+
+class AIAudit(Base):
+    """AI 外发审计：只记元数据，不记 prompt/回答正文。"""
+    __tablename__ = "ai_audit"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    username = Column(String(50), nullable=True)
+    module = Column(String(40), nullable=True)       # classify/contract_extract/ask...
+    ref_type = Column(String(20), nullable=True)     # file/contract/report/query
+    ref_id = Column(Integer, nullable=True)
+    sensitivity = Column(String(5), nullable=True)   # L1~L4
+    chars = Column(Integer, nullable=True)
+    action = Column(String(20), nullable=True)       # sent/blocked/redacted
+    reason = Column(String(200), nullable=True)
+    endpoint = Column(String(100), nullable=True)
+    model = Column(String(50), nullable=True)
+    request_id = Column(String(60), nullable=True)
+
 
 # 建表
 Base.metadata.create_all(bind=engine)
@@ -428,6 +727,101 @@ if "projects" in _inspector.get_table_names():
         with engine.begin() as _conn:
             _conn.execute(text("ALTER TABLE projects ADD COLUMN start_year INTEGER"))
         print("[迁移] 已为 projects 表添加 start_year 列")
+
+# 兼容旧数据库：projects 增加「项目完结」列（完结项目不再产生风险提醒）
+if "projects" in _inspector.get_table_names():
+    _pcols = [c["name"] for c in _inspector.get_columns("projects")]
+    for _col, _type in [
+        ("completed", "INTEGER DEFAULT 0"),
+        ("completed_at", "VARCHAR"),
+        ("completion_note", "TEXT"),
+    ]:
+        if _col not in _pcols:
+            with engine.begin() as _conn:
+                _conn.execute(text(f"ALTER TABLE projects ADD COLUMN {_col} {_type}"))
+            print(f"[迁移] 已为 projects 表添加 {_col} 列")
+    with engine.begin() as _conn:
+        _conn.execute(text("UPDATE projects SET completed = 0 WHERE completed IS NULL"))
+        _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_completed ON projects (completed)"))
+
+# 兼容旧数据库：fundings 升级为「统一经费明细台账」（年度/月份/科目/来源/合同/状态/凭证号）
+if "fundings" in _inspector.get_table_names():
+    _fcols = [c["name"] for c in _inspector.get_columns("fundings")]
+    for _col, _type in [
+        ("year", "INTEGER"),
+        ("month", "INTEGER"),
+        ("category", "VARCHAR(50)"),
+        ("source", "VARCHAR(50)"),
+        ("contract_id", "INTEGER"),
+        ("voucher_no", "VARCHAR(80)"),
+        ("status", "VARCHAR(10) DEFAULT '已确认'"),
+        ("legacy_cell_id", "INTEGER"),
+        ("updated_at", "DATETIME"),
+    ]:
+        if _col not in _fcols:
+            with engine.begin() as _conn:
+                _conn.execute(text(f"ALTER TABLE fundings ADD COLUMN {_col} {_type}"))
+            print(f"[迁移] 已为 fundings 表添加 {_col} 列")
+    with engine.begin() as _conn:
+        # 历史 fund_date 形如 2026-09-24 / 2026.9.24 / 2026/9/24，均按前 4 位年份、第 6 位起月份兜底
+        _conn.execute(text(
+            "UPDATE fundings SET year = CAST(substr(fund_date, 1, 4) AS INTEGER) "
+            "WHERE year IS NULL AND fund_date IS NOT NULL AND length(trim(fund_date)) >= 4"
+        ))
+        _conn.execute(text(
+            "UPDATE fundings SET month = CAST(substr(fund_date, 6, 2) AS INTEGER) "
+            "WHERE month IS NULL AND fund_date LIKE '____-__-__'"
+        ))
+        _conn.execute(text("UPDATE fundings SET status = '已确认' WHERE status IS NULL OR status = ''"))
+        _conn.execute(text("UPDATE fundings SET updated_at = created_at WHERE updated_at IS NULL"))
+        for _idx, _col in [
+            ("ix_fundings_year", "year"),
+            ("ix_fundings_category", "category"),
+            ("ix_fundings_source", "source"),
+            ("ix_fundings_contract_id", "contract_id"),
+        ]:
+            _conn.execute(text(f"CREATE INDEX IF NOT EXISTS {_idx} ON fundings ({_col})"))
+        _conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_fundings_legacy_cell ON fundings (legacy_cell_id)"))
+
+# 兼容旧数据库：funding_attachments 增加 funding_id（附件可精确挂到某条经费明细）
+if "funding_attachments" in _inspector.get_table_names():
+    _acols = [c["name"] for c in _inspector.get_columns("funding_attachments")]
+    if "funding_id" not in _acols:
+        with engine.begin() as _conn:
+            _conn.execute(text("ALTER TABLE funding_attachments ADD COLUMN funding_id INTEGER"))
+        print("[迁移] 已为 funding_attachments 表添加 funding_id 列")
+    with engine.begin() as _conn:
+        _conn.execute(text("CREATE INDEX IF NOT EXISTS ix_funding_attachments_funding_id ON funding_attachments (funding_id)"))
+
+# 一次性把旧「年度经费一览表」单元格迁移为经费明细（用 system_configs 标记，避免删除后重启又复活）
+if "funding_cells" in _inspector.get_table_names() and "fundings" in _inspector.get_table_names():
+    with engine.begin() as _conn:
+        _done = _conn.execute(text(
+            "SELECT value FROM system_configs WHERE key = 'funding_cells_migrated_v2'"
+        )).fetchone()
+        if _done is None:
+            _rows = _conn.execute(text(
+                "SELECT c.id, c.year, c.project_id, c.month, c.amount, c.item_name, c.fund_date, c.created_at "
+                "FROM funding_cells c "
+                "WHERE COALESCE(c.amount, 0) > 0 "
+                "  AND c.id NOT IN (SELECT legacy_cell_id FROM fundings WHERE legacy_cell_id IS NOT NULL)"
+            )).fetchall()
+            for _r in _rows:
+                _conn.execute(text(
+                    "INSERT INTO fundings (project_id, contract_id, item_name, fund_type, amount, fund_date, "
+                    "year, month, category, source, status, legacy_cell_id, remark, created_at, updated_at) "
+                    "VALUES (:pid, NULL, :item, '支出', :amt, :fdate, :year, :month, '其他支出', '未分类', "
+                    "'已确认', :legacy, '由旧年度一览表迁移', :created, :created)"
+                ), {
+                    "pid": _r[2], "item": (_r[5] or "历史年度经费"), "amt": _r[4], "fdate": _r[6],
+                    "year": _r[1], "month": _r[3], "legacy": _r[0], "created": _r[7],
+                })
+            _conn.execute(text(
+                "INSERT OR REPLACE INTO system_configs (key, value, updated_at) "
+                "VALUES ('funding_cells_migrated_v2', :v, datetime('now'))"
+            ), {"v": str(len(_rows))})
+            if _rows:
+                print(f"[迁移] 已将 {len(_rows)} 条旧年度经费单元格迁移为经费明细")
 
 # 初始化系统默认配置（待定口径可配置项，INSERT OR IGNORE 幂等）
 _DEFAULT_CONFIGS = {

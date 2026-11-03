@@ -20,7 +20,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request, Form
 from fastapi.responses import FileResponse, Response, JSONResponse
-from sqlalchemy import text, func
+from sqlalchemy import text, func, or_, and_
 from sqlalchemy.orm import Session
 
 from constants import PROJECT_STAGES, AMOUNT_KINDS
@@ -28,12 +28,16 @@ from utils.text_extract import extract_text_from_file, is_supported_file, _pdf_n
 from config import BASE_DIR, ENV, UPLOAD_DIR, EXTRACT_DIR, DATABASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_API_URL, logger, _append_env
 from utils.storage import _content_path, _save_content, _load_content
 from utils.ai import _fallback_terms, _expand_query, _chunk_text, _call_deepseek
+from utils.ai_gateway import post_deepseek, AIBlocked
 from database import engine, SessionLocal, Base, get_db
 from models import (
     Project, ProjectFile, ContractSummary, DocumentSummary, Contract,
     ContractNode, ContractNodeChange, FinancialDoc, Todo, SystemConfig,
     AuditLog, Funding, FundingGridRow, FundingCell, FundingAttachment,
+    ContractProjectShare,
     Achievement, ProjectContractAmountOverride, AlertDismissed,
+    NetSite, NetSystem, NetDevice, NetAddress, NetFinding,
+    _DEFAULT_CONFIGS,
 )
 import security
 
@@ -283,6 +287,12 @@ app = FastAPI(
     version="0.2.0",
 )
 
+@app.exception_handler(AIBlocked)
+async def ai_blocked_handler(request, exc):
+    """AI 合规网关拦截：返回 403，前端可提示用户确认/脱敏。"""
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+
 
 # ============ 认证中间件 ============
 PUBLIC_PATHS = {"/", "/auth/login", "/docs", "/openapi.json", "/redoc"}
@@ -322,6 +332,16 @@ from routers.auth import router as auth_router
 
 app.include_router(auth_router)
 
+# 网络通讯台账（站点/设备/IP-MAC/拓扑/等保资料）
+from routers.network import router as net_router
+
+app.include_router(net_router)
+
+# AI 合规策略 / 审计
+from routers.ai_policy import router as ai_policy_router
+
+app.include_router(ai_policy_router)
+
 
 # ============ 项目 CRUD ============
 from pydantic import BaseModel
@@ -337,6 +357,7 @@ class AskRequest(BaseModel):
     question: str
     top_k: int = 5
     project_id: Optional[int] = None   # 新增：None 表示搜全部项目
+    confirm_ai: bool = False           # 允许 L3 敏感内容脱敏后使用 AI
 
 
 class CrossProjectRequest(BaseModel):
@@ -379,7 +400,8 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
 
 @app.get("/projects", summary="获取项目列表")
 def list_projects(db: Session = Depends(get_db)):
-    return db.query(Project).order_by(Project.created_at.desc()).all()
+    # 进行中项目优先，已完结项目沉底，便于日常操作
+    return db.query(Project).order_by(Project.completed.asc(), Project.created_at.desc()).all()
 
 
 @app.get("/projects/{project_id}", summary="获取单个项目详情")
@@ -428,6 +450,115 @@ def update_project(project_id: int, project: ProjectUpdate, db: Session = Depend
     return db_project
 
 
+# ============ 合同-项目分摊：共享合同的统一金额口径 ============
+def _contract_total_amount(c: Contract) -> float:
+    """合同含税总额优先，无含税退回合同金额。"""
+    return float(c.amount_incl_tax or c.amount_value or 0)
+
+
+def _all_contract_shares(db: Session, contract_ids: Optional[List[int]] = None) -> dict:
+    """返回 {contract_id: [ContractProjectShare, ...]}；一次查询避免循环查库。"""
+    q = db.query(ContractProjectShare)
+    if contract_ids is not None:
+        if not contract_ids:
+            return {}
+        q = q.filter(ContractProjectShare.contract_id.in_(contract_ids))
+    result: dict = {}
+    for s in q.order_by(ContractProjectShare.id.asc()).all():
+        result.setdefault(s.contract_id, []).append(s)
+    return result
+
+
+def _contract_project_allocations(c: Contract, shares: Optional[list] = None) -> list:
+    """计算合同在各项目间的分摊结果 [(project_id, amount), ...]。
+
+    规则：
+    - 没有分摊行 → 100% 归合同主项目（兼容历史数据）；
+    - 有分摊行 → 按 amount（为空则 ratio × 合同总额）；
+    - 分摊合计与合同总额的差额 → 自动归主项目（前端提示“未分摊余额”），保证各项目合计不重复、不遗漏。
+    """
+    total = _contract_total_amount(c)
+    shares = shares or []
+    if not shares:
+        return [(c.project_id, round(total, 2))] if c.project_id is not None else []
+
+    alloc: dict = {}
+    for s in shares:
+        amt = s.amount if s.amount is not None else (s.ratio or 0) * total
+        alloc[s.project_id] = round(alloc.get(s.project_id, 0.0) + float(amt or 0), 2)
+
+    remainder = round(total - sum(alloc.values()), 2)
+    if abs(remainder) >= 0.005:
+        pid = c.project_id if c.project_id is not None else next(iter(alloc), None)
+        if pid is not None:
+            alloc[pid] = round(alloc.get(pid, 0.0) + remainder, 2)
+    return sorted(alloc.items(), key=lambda x: (x[0] is None, x[0]))
+
+
+def _project_contract_ids(db: Session, project_id: int) -> list:
+    """项目参与的合同 id（主项目 + 分摊项目），用于列表/统计过滤。"""
+    contracts = db.query(Contract).all()
+    shares_map = _all_contract_shares(db)
+    ids = []
+    for c in contracts:
+        alloc = _contract_project_allocations(c, shares_map.get(c.id))
+        if any(pid == project_id for pid, _amt in alloc):
+            ids.append(c.id)
+    return ids
+
+
+def _project_contract_total(db: Session, project_id: int) -> tuple:
+    """项目口径的合同金额与合同数：共享合同只计该项目分摊额，不重复计算。"""
+    contracts = db.query(Contract).all()
+    shares_map = _all_contract_shares(db)
+    total, count = 0.0, 0
+    for c in contracts:
+        for pid, amt in _contract_project_allocations(c, shares_map.get(c.id)):
+            if pid == project_id:
+                total += amt
+                count += 1
+                break
+    return round(total, 2), count
+
+
+def _completed_project_ids(db: Session) -> set:
+    """已完结项目 id 集合：风险提醒、合同超期/临期等统一跳过这些项目。"""
+    return {p.id for p in db.query(Project).filter(Project.completed == 1).all()}
+
+
+class ProjectCompleteRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@app.post("/projects/{project_id}/complete", summary="项目完结：完结后不再生成该项目的风险提醒")
+def complete_project(project_id: int, req: Optional[ProjectCompleteRequest] = None, db: Session = Depends(get_db)):
+    p = db.query(Project).filter(Project.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    p.completed = 1
+    p.completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    p.completion_note = (req.note if req and req.note else "").strip() or None
+    db.commit()
+    # 完结后立即清理该项目已生成的待办，避免角标残留
+    _sync_todos(db)
+    _audit("admin", f"POST /projects/{project_id}/complete", f"项目完结：{p.name}")
+    return {"message": f"项目「{p.name}」已完结，后续不再显示风险提醒", "project": p}
+
+
+@app.post("/projects/{project_id}/reopen", summary="重新开启已完结项目（恢复风险提醒）")
+def reopen_project(project_id: int, db: Session = Depends(get_db)):
+    p = db.query(Project).filter(Project.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    p.completed = 0
+    p.completed_at = None
+    p.completion_note = None
+    db.commit()
+    _sync_todos(db)
+    _audit("admin", f"POST /projects/{project_id}/reopen", f"重新开启项目：{p.name}")
+    return {"message": f"项目「{p.name}」已重新开启", "project": p}
+
+
 @app.get("/projects/{project_id}/dashboard", summary="项目管理聚合：信息卡 + 6 指标 + 4 阶段 + 资料分组")
 def project_dashboard(project_id: int, db: Session = Depends(get_db)):
     """单项目一屏聚合：文件数/合同数/合同总金额/经费投入/成果数/待办数 + 四阶段资料数 + 资料按阶段分组。"""
@@ -436,14 +567,14 @@ def project_dashboard(project_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="项目不存在")
 
     files = db.query(ProjectFile).filter(ProjectFile.project_id == project_id).all()
-    contracts = db.query(Contract).filter(Contract.project_id == project_id).all()
     fundings = db.query(Funding).filter(Funding.project_id == project_id).all()
     achievements = db.query(Achievement).filter(Achievement.project_id == project_id).all()
 
     file_count = len(files)
-    contract_count = len(contracts)
-    contract_total_amount = round(sum((c.amount_incl_tax or c.amount_value or 0) for c in contracts), 2)
+    # 合同口径：共享合同只计本项目分摊额；合同数也按“参与合同”计
+    contract_total_amount, contract_count = _project_contract_total(db, project_id)
     funding_income = round(sum(f.amount or 0 for f in fundings if f.fund_type == "到账"), 2)
+    funding_expense = round(sum(f.amount or 0 for f in fundings if f.fund_type == "支出"), 2)
     achievement_count = len(achievements)
     todo_count = sum(1 for it in _generate_todo_items(db) if it.get("project_id") == project_id)
 
@@ -480,6 +611,9 @@ def project_dashboard(project_id: int, db: Session = Depends(get_db)):
             "description": project.description or "",
             "stage": project.stage or "项目立项",
             "start_year": project.start_year,
+            "completed": int(project.completed or 0),
+            "completed_at": project.completed_at or "",
+            "completion_note": project.completion_note or "",
             "created_at": project.created_at.strftime("%Y-%m-%d %H:%M:%S") if project.created_at else "",
         },
         "metrics": {
@@ -487,6 +621,7 @@ def project_dashboard(project_id: int, db: Session = Depends(get_db)):
             "contract_count": contract_count,
             "contract_total_amount": contract_total_amount,
             "funding_income": funding_income,
+            "funding_expense": funding_expense,
             "achievement_count": achievement_count,
             "todo_count": todo_count,
         },
@@ -556,14 +691,14 @@ async def upload_file(
         db_file.ai_summary = "（该文件类型暂不支持内容解析，已作为附件保存）"
         db_file.processing_status = "done"
         db.commit()
-        return db_file
+        return _file_to_dict(db_file)
 
     # ---- 纯扫描版 PDF 走后台 OCR：先入库立即返回，OCR + 分类在后台完成后自动回填 ----
     if ext.lower() == ".pdf" and _pdf_needs_ocr(file_path):
         db_file.processing_status = "processing"
         db.commit()
         _ocr_executor.submit(_process_file_async, db_file.id, project_id, file_path, file.filename, stored_name)
-        return db_file
+        return _file_to_dict(db_file)
 
     # ---- 同步路径：非扫描件直接提取文本 → 智能分类 ----
     try:
@@ -586,7 +721,7 @@ async def upload_file(
 
     db_file.processing_status = "done"
     db.commit()
-    return db_file
+    return _file_to_dict(db_file)
 
 
 def _file_to_dict(f: ProjectFile) -> dict:
@@ -895,23 +1030,28 @@ def _detect_stat_queries(q: str):
 
 # ---- 聚合查询执行器（受 project_id 下推；成果例外——平台级共享不过滤）----
 def _agg_contract_count_total(project_id, db, ach_category=None, ach_status=None):
-    q = db.query(func.count(Contract.id))
     if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
+        return {"name": "contract_count_total", "label": "合同总数",
+                "value": len(_project_contract_ids(db, project_id)), "unit": "份"}
+    q = db.query(func.count(Contract.id))
     return {"name": "contract_count_total", "label": "合同总数", "value": q.scalar() or 0, "unit": "份"}
 
 
 def _agg_contract_amount_total(project_id, db, ach_category=None, ach_status=None):
-    q = db.query(func.sum(func.coalesce(func.nullif(Contract.amount_incl_tax, 0), Contract.amount_value, 0)))
     if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
+        amount, _count = _project_contract_total(db, project_id)
+        return {"name": "contract_amount_total", "label": "合同总金额", "value": amount, "unit": "元"}
+    q = db.query(func.sum(func.coalesce(func.nullif(Contract.amount_incl_tax, 0), Contract.amount_value, 0)))
     return {"name": "contract_amount_total", "label": "合同总金额", "value": round(q.scalar() or 0, 2), "unit": "元"}
 
 
 def _agg_contract_count_by_type(project_id, db, ach_category=None, ach_status=None):
     q = db.query(Contract.contract_type, func.count(Contract.id))
     if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
+        ids = _project_contract_ids(db, project_id)
+        if not ids:
+            return {"name": "contract_count_by_type", "label": "合同类型分布", "value": None, "unit": "份", "detail": []}
+        q = q.filter(Contract.id.in_(ids))
     rows = q.group_by(Contract.contract_type).all()
     detail = [(t or "未分类", c) for t, c in rows]
     return {"name": "contract_count_by_type", "label": "合同类型分布", "value": None, "unit": "份", "detail": detail}
@@ -920,7 +1060,10 @@ def _agg_contract_count_by_type(project_id, db, ach_category=None, ach_status=No
 def _agg_contract_count_by_status(project_id, db, ach_category=None, ach_status=None):
     q = db.query(Contract)
     if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
+        ids = _project_contract_ids(db, project_id)
+        if not ids:
+            return {"name": "contract_count_by_status", "label": "合同状态分布", "value": None, "unit": "份", "detail": []}
+        q = q.filter(Contract.id.in_(ids))
     by = {"已超期": 0, "即将到期": 0, "正常": 0, "未识别": 0}
     for c in q.all():
         st_, _ = _contract_status(c.due_date)
@@ -1125,6 +1268,52 @@ def _build_stat_note(names):
 
 # ============ 健康检查 ============
 # ============ 智能问答接口 ============
+def _local_answer_fallback(question: str, stat_lines=None):
+    """AI 被合规拦截时的本地兜底：优先网络台账结构化问答，其次本地资料片段。"""
+    parts, refs = [], []
+    try:
+        from routers.network import local_answer as _net_local_answer
+        lr = _net_local_answer(question)
+        if lr and lr.get("answer"):
+            parts.append(lr["answer"])
+            for src in (lr.get("sources") or []):
+                refs.append({"original_name": str(src), "project_name": "网络通讯台账"})
+    except Exception as e:
+        logger.warning("[本地兜底] 网络台账问答失败：%s", e)
+    if stat_lines:
+        parts.append("【本地精确统计】\n" + "\n".join(stat_lines))
+    if not parts:
+        terms = _fallback_terms(question)[:6]
+        db = SessionLocal()
+        try:
+            rows = (db.query(ProjectFile, Project)
+                    .join(Project, ProjectFile.project_id == Project.id)
+                    .limit(400).all())
+            for f, proj in rows:
+                try:
+                    content = _load_content(f)
+                except Exception:
+                    continue
+                if not content:
+                    continue
+                for term in terms:
+                    idx = content.find(term)
+                    if idx >= 0:
+                        snippet = content[max(0, idx - 60):idx + 120].replace("\n", " ")
+                        parts.append(f"- 《{f.original_name}》（{proj.name}）：…{snippet}…")
+                        refs.append({"original_name": f.original_name, "project_name": proj.name,
+                                     "download_url": f"/files/{f.id}/download"})
+                        break
+                if len(parts) >= 5:
+                    break
+        finally:
+            db.close()
+    if not parts:
+        parts.append("该问题涉及 L4/L3 敏感数据，已按合规策略禁止外发 AI；本地台账也未找到直接答案。"
+                     "可尝试：设备数量、IP 冲突、等保符合率、整改逾期、拓扑图。")
+    return "\n\n".join(parts), refs
+
+
 @app.post("/ask", summary="智能问答")
 def ask_question(req: AskRequest):
     """基于知识库内容的智能问答（RAG）：分块检索 + 单次综合回答。
@@ -1154,8 +1343,14 @@ def ask_question(req: AskRequest):
             db.close()
 
     # 2) 两路检索：项目资料 + 成果台账（统计未命中时为主检索；命中时用于明细/溯源）
-    chunks, references = _retrieve_context(question, half, project_id=req.project_id)
-    ach_chunks, ach_refs = _retrieve_achievement_context(question, half, project_id=req.project_id)
+    try:
+        chunks, references = _retrieve_context(question, half, project_id=req.project_id)
+        ach_chunks, ach_refs = _retrieve_achievement_context(question, half, project_id=req.project_id)
+    except AIBlocked as e:
+        local_text, local_refs = _local_answer_fallback(question, stat_lines)
+        return {"answer": local_text, "references": local_refs + list_refs,
+                "stat_note": stat_note, "statistics": stat_items,
+                "blocked": True, "reason": str(e), "mode": "local"}
     chunks = chunks + ach_chunks + list_chunks
     references = references + ach_refs + list_refs
 
@@ -1164,6 +1359,16 @@ def ask_question(req: AskRequest):
         stat_context = "【精确统计结果】\n" + "\n".join(stat_lines)
 
     if not chunks and not stat_lines:
+        # 没有项目资料时，先尝试网络台账本地问答（等保/设备/IP 等敏感数据不走 AI）
+        try:
+            from routers.network import local_answer as _net_local_answer
+            lr = _net_local_answer(question)
+        except Exception:
+            lr = None
+        if lr and lr.get("answer"):
+            return {"answer": lr["answer"], "references": [], "stat_note": "", "statistics": [],
+                    "blocked": True, "mode": "local",
+                    "reason": "该问题涉及本地/敏感台账，已按合规策略使用本地模式。"}
         return {
             "answer": "资料中没有找到相关内容。请尝试更换关键词，或先上传相关文档。",
             "references": [],
@@ -1180,7 +1385,12 @@ def ask_question(req: AskRequest):
 
     logger.info(f"[问答] 命中 {len(chunks)} 个相关片段 / 统计 {len(stat_lines)} 条 / 共 {len(context)} 字，开始生成回答")
     try:
-        answer = _call_deepseek(question, context)
+        answer = _call_deepseek(question, context, confirm_l3=getattr(req, 'confirm_ai', False))
+    except AIBlocked as e:
+        local_text, local_refs = _local_answer_fallback(question, stat_lines)
+        return {"answer": local_text, "references": references + local_refs,
+                "stat_note": stat_note, "statistics": stat_items,
+                "blocked": True, "reason": str(e), "mode": "local"}
     except Exception as e:
         print(f"[问答] 调用 DeepSeek 失败：{e}")
         raise HTTPException(status_code=500, detail=f"调用 DeepSeek 失败：{e}")
@@ -1211,7 +1421,7 @@ def _call_deepseek_summary(content: str) -> str:
         "max_tokens": 300,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+    resp = post_deepseek(payload, module="file_summary", scan_text=content, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]
@@ -1281,7 +1491,7 @@ def _extract_contract_fields(content: str) -> dict:
         "max_tokens": 1000,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+    resp = post_deepseek(payload, module="contract_extract", scan_text=text_part, timeout=60)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -1434,7 +1644,7 @@ def _extract_document_summary(content: str) -> dict:
         "max_tokens": 600,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=60)
+    resp = post_deepseek(payload, module="document_summary", scan_text=text_part, timeout=60)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -1552,7 +1762,7 @@ def _classify_file(content: str, filename: str = "") -> dict:
         "max_tokens": 1200,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="classify", scan_text=text_part, filename=filename, timeout=120)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -1685,6 +1895,16 @@ def _process_file_async(file_id: int, project_id: int, file_path: str, original_
                     _import_contract_from_project_file(db, f.id)
                 except Exception as e:
                     logger.error(f"[后台] 自动导入合同失败 {original_name}：{e}")
+        except AIBlocked as e:
+            # L4 文件按合规策略禁止外发：文件保留，人工分类
+            logger.warning(f"[后台] AI 合规拦截 {original_name}：{e}")
+            db.rollback()
+            f = db.query(ProjectFile).filter(ProjectFile.id == file_id).first()
+            if f is not None:
+                f.category = f.category or "附件"
+                f.ai_summary = "AI 合规拦截：判定为 L4 敏感文件，未外发；请人工分类/查看。"
+                f.processing_status = "done"
+                db.commit()
         except Exception as e:
             logger.error(f"[后台] 智能分类失败 {original_name}：{e}")
             db.rollback()
@@ -1917,7 +2137,7 @@ def project_stats(project_id: int, req: AskRequest, db: Session = Depends(get_db
         "max_tokens": 8100,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="contract_stats", scan_text=json.dumps(items, ensure_ascii=False), timeout=120)
     resp.raise_for_status()
     answer = resp.json()["choices"][0]["message"]["content"]
 
@@ -1971,7 +2191,7 @@ def documents_summarize(project_id: int, req: AskRequest, db: Session = Depends(
         "max_tokens": 8100,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="documents_summarize", scan_text=json.dumps(items, ensure_ascii=False), timeout=120)
     resp.raise_for_status()
     answer = resp.json()["choices"][0]["message"]["content"]
 
@@ -2046,7 +2266,7 @@ def _extract_cross_project_target(question: str) -> dict:
         "max_tokens": 400,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+    resp = post_deepseek(payload, module="cross_target", scan_text=question, timeout=30)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -2111,7 +2331,7 @@ def _call_deepseek_cross_project(question: str, target: dict, stats: dict, items
         "max_tokens": 8100,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="cross_report", scan_text=item_text, timeout=120)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -2328,7 +2548,7 @@ def _extract_contract_fields(content: str, filename: str = "") -> dict:
         "max_tokens": 3000,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="contract_extract", scan_text=text_part, filename=filename, timeout=120)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -2515,6 +2735,12 @@ def _process_contract_async(contract_id: int, file_path: str, original_name: str
         if content and content.strip():
             try:
                 fields = _extract_contract_fields(content, original_name)
+            except AIBlocked as e:
+                c.processing_status = "done"
+                c.service_content = f"AI合规拦截：{e}（可在侧边栏开启 L3 自动或人工填写）"
+                db.commit()
+                logger.warning(f"[合同后台] AI 合规拦截 {original_name}：{e}")
+                return
             except Exception as e:
                 logger.error(f"[合同后台] 抽取字段失败 {original_name}：{e}")
 
@@ -2724,18 +2950,26 @@ async def upload_contracts(
     return {"uploaded": results, "errors": errors}
 
 
-@app.get("/contracts", summary="合同列表（可按项目筛选）")
+@app.get("/contracts", summary="合同列表（可按项目筛选；共享合同按分摊项目计入）")
 def list_contracts(project_id: Optional[int] = None, db: Session = Depends(get_db)):
-    q = db.query(Contract)
-    if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
-    contracts = q.order_by(Contract.created_at.desc()).all()
-    # 附带项目名，供前端下拉识别「该合同属于哪个项目」（LLM 抽取的合同名常过于泛化，需项目名兜底）
+    all_contracts = db.query(Contract).order_by(Contract.created_at.desc()).all()
+    shares_map = _all_contract_shares(db)
     pmap = {p.id: p.name for p in db.query(Project).all()}
     result = []
-    for c in contracts:
+    for c in all_contracts:
+        alloc = _contract_project_allocations(c, shares_map.get(c.id))
+        alloc_pids = [pid for pid, _amt in alloc]
+        if project_id is not None and project_id not in alloc_pids:
+            continue
         d = _contract_to_dict(c)
         d["project_name"] = pmap.get(c.project_id, "")
+        d["allocations"] = [
+            {"project_id": pid, "project_name": pmap.get(pid, ""), "amount": round(amt, 2)}
+            for pid, amt in alloc
+        ]
+        d["is_shared"] = len(alloc) > 1
+        if project_id is not None:
+            d["share_amount"] = round(sum(amt for pid, amt in alloc if pid == project_id), 2)
         result.append(d)
     return result
 
@@ -2909,11 +3143,29 @@ def contract_stats(
     project_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
-    q = db.query(Contract)
-    if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
-    contracts = q.all()
-    items = [_contract_to_dict(c) for c in contracts]
+    all_contracts = db.query(Contract).all()
+    shares_map = _all_contract_shares(db)
+    completed_ids = _completed_project_ids(db)
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    items = []
+    for c in all_contracts:
+        alloc = _contract_project_allocations(c, shares_map.get(c.id))
+        alloc_pids = [pid for pid, _amt in alloc]
+        if project_id is not None and project_id not in alloc_pids:
+            continue
+        d = _contract_to_dict(c)
+        d["allocations"] = [
+            {"project_id": pid, "project_name": pmap.get(pid, ""), "amount": round(amt, 2)}
+            for pid, amt in alloc
+        ]
+        d["is_shared"] = len(alloc) > 1
+        if project_id is not None:
+            # 项目视角：金额取本项目分摊额，不把共享合同全额算进来
+            share = round(sum(amt for pid, amt in alloc if pid == project_id), 2)
+            d["share_amount"] = share
+            d["amount_value"] = share
+            d["amount_incl_tax"] = share
+        items.append(d)
 
     # 时间筛选：按签订日期（sign_date）或到期日（due_date）过滤
     field = date_field if date_field in ("sign_date", "due_date") else "sign_date"
@@ -2935,8 +3187,11 @@ def contract_stats(
         a = c["party_a"] or "未识别甲方"
         by_party_a[a] = round(by_party_a.get(a, 0) + c["amount_value"], 2)
 
-    overdue = [c for c in items if c["status"] == "已超期" and not c.get("alert_ignored")]
-    upcoming = [c for c in items if c["status"] == "即将到期" and not c.get("alert_ignored")]
+    # 已完结项目不再显示合同超期/临期风险
+    overdue = [c for c in items if c["status"] == "已超期" and not c.get("alert_ignored")
+               and c.get("project_id") not in completed_ids]
+    upcoming = [c for c in items if c["status"] == "即将到期" and not c.get("alert_ignored")
+                and c.get("project_id") not in completed_ids]
 
     return {
         "total_count": total_count,
@@ -3113,102 +3368,448 @@ def contract_deduplicate(db: Session = Depends(get_db)):
     return {"deleted_ids": deleted_ids, "deleted_names": deleted_names, "count": len(deleted_ids)}
 
 
-# ============ 经费管理 ============
+# ============ 经费管理（v2：统一明细台账 + 合同分摊 + 年度逐项核对） ============
 FUNDING_TYPES = ["预算", "到账", "支出"]
+FUNDING_CATEGORIES = [
+    "设备费", "材料费", "测试化验加工费", "燃料动力费", "差旅费", "会议费",
+    "国际合作与交流费", "出版/文献/信息传播/知识产权事务费", "劳务费",
+    "专家咨询费", "管理费", "其他支出",
+]
+FUNDING_SOURCES = ["国拨经费", "省拨经费", "集团拨款", "企业自筹", "其他"]
+
+
+def _to_float_safe(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _funding_year(f: Funding):
+    if f.year:
+        return int(f.year)
+    dt = _parse_date(f.fund_date) if f.fund_date else None
+    return dt.year if dt else None
+
+
+def _funding_month(f: Funding):
+    if f.month:
+        return int(f.month)
+    dt = _parse_date(f.fund_date) if f.fund_date else None
+    return dt.month if dt else None
+
+
+def _resolve_funding_period(fund_date, year, month):
+    """年度/月份：显式传入优先；否则由发生日期推导；都没有时年度默认今年（便于录入）。"""
+    y = int(year) if year not in (None, "") else None
+    m = int(month) if month not in (None, "") else None
+    dt = _parse_date(fund_date) if fund_date else None
+    if dt:
+        y = y or dt.year
+        m = m or dt.month
+    if y is None:
+        y = date.today().year
+    if m is not None and not (1 <= m <= 12):
+        raise HTTPException(status_code=400, detail="月份需在 1~12 之间")
+    return y, m
+
+
+def _funding_to_dict(f: Funding, pmap=None, cmap=None) -> dict:
+    pmap = pmap or {}
+    cmap = cmap or {}
+    c = cmap.get(f.contract_id)
+    p = pmap.get(f.project_id)
+    cname = ""
+    if c is not None:
+        cname = c.contract_name or c.original_name or f"合同#{c.id}"
+    return {
+        "id": f.id,
+        "project_id": f.project_id,
+        "project_name": (p.name if p is not None else ("平台级" if f.project_id is None else f"项目#{f.project_id}")),
+        "project_completed": int(getattr(p, "completed", 0) or 0) if p is not None else 0,
+        "contract_id": f.contract_id,
+        "contract_name": cname,
+        "contract_no": (c.contract_no or "") if c is not None else "",
+        "item_name": f.item_name or "",
+        "fund_type": f.fund_type or "支出",
+        "amount": round(f.amount or 0, 2),
+        "fund_date": f.fund_date or "",
+        "year": _funding_year(f),
+        "month": _funding_month(f),
+        "category": f.category or "未分类",
+        "source": f.source or "未分类",
+        "voucher_no": f.voucher_no or "",
+        "status": f.status or "已确认",
+        "remark": f.remark or "",
+        "legacy_cell_id": f.legacy_cell_id,
+        "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S") if f.created_at else "",
+        "updated_at": f.updated_at.strftime("%Y-%m-%d %H:%M:%S") if f.updated_at else "",
+    }
+
+
+def _validate_funding_contract(db: Session, project_id, contract_id):
+    """校验合同与项目关系：共享合同必须先配置分摊，且只能记到参与分摊的项目。"""
+    if not contract_id:
+        return project_id
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="关联合同不存在")
+    if project_id is None:
+        project_id = c.project_id
+    if project_id is None:
+        raise HTTPException(status_code=400, detail="关联合同后必须选择归属项目")
+    alloc = _contract_project_allocations(c, _all_contract_shares(db).get(c.id))
+    if project_id not in [pid for pid, _amt in alloc]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"合同「{c.contract_name or c.original_name}」未分摊到该项目，请先在「合同分摊」中配置",
+        )
+    return project_id
 
 
 class FundingCreate(BaseModel):
     project_id: Optional[int] = None
+    contract_id: Optional[int] = None
     item_name: str
-    fund_type: Optional[str] = "到账"
+    fund_type: Optional[str] = "支出"
     amount: float
     fund_date: Optional[str] = None
+    year: Optional[int] = None
+    month: Optional[int] = None
+    category: Optional[str] = None
+    source: Optional[str] = None
+    voucher_no: Optional[str] = None
+    status: Optional[str] = "已确认"
     remark: Optional[str] = None
 
 
-def _funding_to_dict(f: Funding, project_name: str = "") -> dict:
-    return {
-        "id": f.id,
-        "project_id": f.project_id,
-        "project_name": project_name,
-        "item_name": f.item_name,
-        "fund_type": f.fund_type or "到账",
-        "amount": f.amount or 0,
-        "fund_date": f.fund_date or "",
-        "remark": f.remark or "",
-        "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S") if f.created_at else "",
-    }
+class FundingUpdate(BaseModel):
+    project_id: Optional[int] = None
+    contract_id: Optional[int] = None
+    item_name: Optional[str] = None
+    fund_type: Optional[str] = None
+    amount: Optional[float] = None
+    fund_date: Optional[str] = None
+    year: Optional[int] = None
+    month: Optional[int] = None
+    category: Optional[str] = None
+    source: Optional[str] = None
+    voucher_no: Optional[str] = None
+    status: Optional[str] = None
+    remark: Optional[str] = None
 
 
-@app.post("/fundings", summary="新增经费记录")
-def create_funding(req: FundingCreate, db: Session = Depends(get_db)):
+def _create_funding_record(db: Session, req: FundingCreate) -> Funding:
     if not req.item_name or not req.item_name.strip():
-        raise HTTPException(status_code=400, detail="经费科目必填")
-    if req.amount is None:
-        raise HTTPException(status_code=400, detail="金额必填")
+        raise HTTPException(status_code=400, detail="经费摘要/科目名称必填")
+    amount = _to_float_safe(req.amount)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="金额需大于 0")
+    pid = _validate_funding_contract(db, req.project_id, req.contract_id)
+    year, month = _resolve_funding_period(req.fund_date, req.year, req.month)
     f = Funding(
-        project_id=req.project_id,
+        project_id=pid,
+        contract_id=req.contract_id or None,
         item_name=req.item_name.strip(),
-        fund_type=req.fund_type or "到账",
-        amount=req.amount,
-        fund_date=req.fund_date or None,
-        remark=req.remark or None,
+        fund_type=req.fund_type if req.fund_type in FUNDING_TYPES else "支出",
+        amount=amount,
+        fund_date=(req.fund_date or "").strip() or None,
+        year=year,
+        month=month,
+        category=(req.category or "").strip() or "其他支出",
+        source=(req.source or "").strip() or "其他",
+        voucher_no=(req.voucher_no or "").strip() or None,
+        status=(req.status or "已确认").strip() or "已确认",
+        remark=(req.remark or "").strip() or None,
     )
     db.add(f)
     db.commit()
     db.refresh(f)
-    _audit("admin", "POST /fundings", f"新增经费：{f.item_name} {f.amount}")
-    return _funding_to_dict(f)
+    _audit("admin", "POST /funding/entries",
+           f"新增经费明细：{f.item_name} {f.amount}（{f.year}-{f.month or '-'}）")
+    return f
 
 
-@app.get("/fundings", summary="经费列表（可按项目筛选）")
-def list_fundings(project_id: Optional[int] = None, db: Session = Depends(get_db)):
+@app.post("/fundings", summary="新增经费记录（兼容旧接口）")
+def create_funding(req: FundingCreate, db: Session = Depends(get_db)):
+    f = _create_funding_record(db, req)
+    pmap = {p.id: p for p in db.query(Project).all()}
+    cmap = {c.id: c for c in db.query(Contract).all()}
+    return _funding_to_dict(f, pmap, cmap)
+
+
+@app.post("/funding/entries", summary="新增经费明细")
+def create_funding_entry(req: FundingCreate, db: Session = Depends(get_db)):
+    return create_funding(req, db)
+
+
+def _funding_query(db: Session, year=None, project_id=None, contract_id=None, fund_type=None,
+                   category=None, source=None, status=None, keyword=None,
+                   date_from=None, date_to=None, include_completed=True):
     q = db.query(Funding)
+    if year is not None:
+        q = q.filter(or_(Funding.year == int(year),
+                         and_(Funding.year.is_(None), Funding.fund_date.like(f"{int(year)}%"))))
     if project_id is not None:
         q = q.filter(Funding.project_id == project_id)
-    items = q.order_by(Funding.created_at.desc()).all()
-    pmap = {p.id: p.name for p in db.query(Project).all()}
-    return [_funding_to_dict(f, pmap.get(f.project_id, "")) for f in items]
+    if contract_id is not None:
+        q = q.filter(Funding.contract_id == contract_id)
+    if fund_type:
+        q = q.filter(Funding.fund_type == fund_type)
+    if category:
+        q = q.filter(Funding.category == category)
+    if source:
+        q = q.filter(Funding.source == source)
+    if status:
+        q = q.filter(Funding.status == status)
+    if keyword:
+        kw = f"%{keyword.strip()}%"
+        q = q.filter(or_(Funding.item_name.ilike(kw), Funding.remark.ilike(kw),
+                         Funding.voucher_no.ilike(kw)))
+    if date_from:
+        q = q.filter(Funding.fund_date >= date_from)
+    if date_to:
+        q = q.filter(Funding.fund_date <= date_to)
+    items = q.order_by(Funding.fund_date.desc(), Funding.id.desc()).all()
+    if not include_completed:
+        completed = _completed_project_ids(db)
+        items = [f for f in items if f.project_id not in completed]
+    return items
 
 
-@app.delete("/fundings/{funding_id}", summary="删除经费记录")
-def delete_funding(funding_id: int, db: Session = Depends(get_db)):
-    f = db.query(Funding).filter(Funding.id == funding_id).first()
-    if not f:
-        raise HTTPException(status_code=404, detail="经费记录不存在")
-    db.delete(f)
-    db.commit()
-    return {"message": f"经费「{f.item_name}」已删除"}
-
-
-@app.get("/fundings/stats", summary="经费统计（预算/到账/支出/结余 + 分布，支持时间筛选）")
-def funding_stats(start: Optional[str] = None, end: Optional[str] = None, db: Session = Depends(get_db)):
-    items = db.query(Funding).all()
-    if start or end:
-        items = [f for f in items if _date_in_range(f.fund_date, start, end)]
-    pmap = {p.id: p.name for p in db.query(Project).all()}
-    budget = sum(f.amount or 0 for f in items if f.fund_type == "预算")
-    income = sum(f.amount or 0 for f in items if f.fund_type == "到账")
-    expense = sum(f.amount or 0 for f in items if f.fund_type == "支出")
-    by_type = {}
-    by_project = {}
+def _funding_summary(items: list) -> dict:
+    by_type, by_category, by_source, by_project = {}, {}, {}, {}
     for f in items:
+        amt = round(f.amount or 0, 2)
         t = f.fund_type or "其他"
-        by_type[t] = round(by_type.get(t, 0) + (f.amount or 0), 2)
-        pname = pmap.get(f.project_id, "平台级")
-        by_project[pname] = round(by_project.get(pname, 0) + (f.amount or 0), 2)
+        by_type[t] = round(by_type.get(t, 0) + amt, 2)
+        c = f.category or "未分类"
+        by_category[c] = round(by_category.get(c, 0) + amt, 2)
+        s = f.source or "未分类"
+        by_source[s] = round(by_source.get(s, 0) + amt, 2)
+        p = str(f.project_id) if f.project_id is not None else "0"
+        by_project[p] = round(by_project.get(p, 0) + amt, 2)
     return {
-        "total_count": len(items),
-        "budget": round(budget, 2),
-        "income": round(income, 2),
-        "expense": round(expense, 2),
-        "balance": round(income - expense, 2),
+        "count": len(items),
+        "amount": round(sum(f.amount or 0 for f in items), 2),
+        "budget": round(sum(f.amount or 0 for f in items if f.fund_type == "预算"), 2),
+        "income": round(sum(f.amount or 0 for f in items if f.fund_type == "到账"), 2),
+        "expense": round(sum(f.amount or 0 for f in items if f.fund_type == "支出"), 2),
+        "balance": round(sum(f.amount or 0 for f in items if f.fund_type == "到账")
+                         - sum(f.amount or 0 for f in items if f.fund_type == "支出"), 2),
         "by_type": by_type,
+        "by_category": by_category,
+        "by_source": by_source,
         "by_project": by_project,
     }
 
 
-# ============ 年度经费一览表（项目 × 月份 矩阵）============
+@app.get("/fundings", summary="经费列表（兼容旧接口）")
+def list_fundings(project_id: Optional[int] = None, year: Optional[int] = None,
+                  db: Session = Depends(get_db)):
+    pmap = {p.id: p for p in db.query(Project).all()}
+    cmap = {c.id: c for c in db.query(Contract).all()}
+    return [_funding_to_dict(f, pmap, cmap) for f in _funding_query(db, year=year, project_id=project_id)]
+
+
+@app.get("/funding/entries", summary="经费明细查询（年度/项目/合同/类型/科目/来源/关键词）")
+def list_funding_entries(
+    year: Optional[int] = None,
+    project_id: Optional[int] = None,
+    contract_id: Optional[int] = None,
+    fund_type: Optional[str] = None,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    keyword: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    include_completed: bool = True,
+    limit: int = 500,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    items = _funding_query(db, year=year, project_id=project_id, contract_id=contract_id,
+                           fund_type=fund_type, category=category, source=source,
+                           status=status, keyword=keyword, date_from=date_from,
+                           date_to=date_to, include_completed=include_completed)
+    summary = _funding_summary(items)
+    pmap = {p.id: p for p in db.query(Project).all()}
+    cmap = {c.id: c for c in db.query(Contract).all()}
+    page = items[offset: offset + max(1, min(limit, 2000))]
+    return {
+        "items": [_funding_to_dict(f, pmap, cmap) for f in page],
+        "total": len(items),
+        "summary": summary,
+        "years": sorted({_funding_year(f) for f in db.query(Funding).all()
+                         if _funding_year(f) is not None}, reverse=True),
+    }
+
+
+@app.get("/funding/meta", summary="经费管理元数据（项目/合同分摊/分类/年度）")
+def funding_meta(db: Session = Depends(get_db)):
+    projects = db.query(Project).order_by(Project.completed.asc(), Project.created_at.desc()).all()
+    contracts = db.query(Contract).order_by(Contract.created_at.desc()).all()
+    shares_map = _all_contract_shares(db)
+    cmap = {c.id: c for c in contracts}
+    pmap = {p.id: p for p in projects}
+    contract_items = []
+    for c in contracts:
+        alloc = _contract_project_allocations(c, shares_map.get(c.id))
+        raw = shares_map.get(c.id, [])
+        total = _contract_total_amount(c)
+        raw_sum = round(sum((s.amount if s.amount is not None else (s.ratio or 0) * total)
+                            for s in raw), 2) if raw else 0.0
+        contract_items.append({
+            "id": c.id,
+            "name": c.contract_name or c.original_name or f"合同#{c.id}",
+            "contract_name": c.contract_name or "",
+            "original_name": c.original_name or "",
+            "contract_no": c.contract_no or "",
+            "project_id": c.project_id,
+            "project_name": pmap.get(c.project_id).name if pmap.get(c.project_id) else "",
+            "total": round(total, 2),
+            "confirmed": c.confirmed or 0,
+            "allocations": [
+                {"project_id": pid, "project_name": pmap.get(pid).name if pmap.get(pid) else f"项目#{pid}",
+                 "amount": round(amt, 2)}
+                for pid, amt in alloc
+            ],
+            "raw_share_sum": raw_sum,
+            "unallocated": round(total - raw_sum, 2) if raw else 0.0,
+            "is_shared": len(alloc) > 1,
+        })
+    years = {_funding_year(f) for f in db.query(Funding).all() if _funding_year(f) is not None}
+    years |= {r.year for r in db.query(FundingGridRow).all()}
+    cur = date.today().year
+    years |= {cur - 2, cur - 1, cur, cur + 1}
+    return {
+        "projects": [{
+            "id": p.id, "code": p.code, "name": p.name, "stage": p.stage or "项目立项",
+            "start_year": p.start_year, "completed": int(p.completed or 0),
+            "completed_at": p.completed_at or "", "completion_note": p.completion_note or "",
+        } for p in projects],
+        "contracts": contract_items,
+        "categories": FUNDING_CATEGORIES,
+        "sources": FUNDING_SOURCES,
+        "fund_types": FUNDING_TYPES,
+        "years": sorted(years, reverse=True),
+    }
+
+
+@app.get("/funding/entries/{entry_id}", summary="经费明细详情（含附件）")
+def get_funding_entry(entry_id: int, db: Session = Depends(get_db)):
+    f = db.query(Funding).filter(Funding.id == entry_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="经费明细不存在")
+    pmap = {p.id: p for p in db.query(Project).all()}
+    cmap = {c.id: c for c in db.query(Contract).all()}
+    d = _funding_to_dict(f, pmap, cmap)
+    d["attachments"] = [_grid_att_to_dict(a) for a in
+                        db.query(FundingAttachment).filter(FundingAttachment.funding_id == f.id).all()]
+    return d
+
+
+@app.put("/funding/entries/{entry_id}", summary="修改经费明细")
+@app.put("/fundings/{entry_id}", summary="修改经费明细（兼容旧接口）")
+def update_funding_entry(entry_id: int, req: FundingUpdate, db: Session = Depends(get_db)):
+    f = db.query(Funding).filter(Funding.id == entry_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="经费明细不存在")
+    data = req.dict(exclude_unset=True)
+
+    if "item_name" in data:
+        name = (data["item_name"] or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="经费摘要/科目名称不能为空")
+        f.item_name = name
+    if "amount" in data:
+        amt = _to_float_safe(data["amount"])
+        if amt <= 0:
+            raise HTTPException(status_code=400, detail="金额需大于 0")
+        f.amount = amt
+    if "project_id" in data or "contract_id" in data:
+        pid = data.get("project_id", f.project_id)
+        cid = data.get("contract_id", f.contract_id)
+        pid = _validate_funding_contract(db, pid, cid)
+        f.project_id = pid
+        f.contract_id = cid or None
+    if "fund_type" in data:
+        f.fund_type = data["fund_type"] if data["fund_type"] in FUNDING_TYPES else "支出"
+    if "fund_date" in data:
+        f.fund_date = (data["fund_date"] or "").strip() or None
+    if "year" in data or "month" in data or "fund_date" in data:
+        if "fund_date" in data:
+            y_in, m_in = data.get("year"), data.get("month")
+        else:
+            y_in, m_in = data.get("year", f.year), data.get("month", f.month)
+        y, m = _resolve_funding_period(f.fund_date, y_in, m_in)
+        f.year, f.month = y, m
+    for k in ("category", "source", "voucher_no", "status", "remark"):
+        if k in data:
+            v = (data[k] or "").strip() if isinstance(data[k], str) else data[k]
+            setattr(f, k, v or ("其他支出" if k == "category" else ("其他" if k == "source" else None)))
+    f.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(f)
+    _audit("admin", "PUT /funding/entries", f"修改经费明细 #{f.id}：{f.item_name} {f.amount}")
+    pmap = {p.id: p for p in db.query(Project).all()}
+    cmap = {c.id: c for c in db.query(Contract).all()}
+    return _funding_to_dict(f, pmap, cmap)
+
+
+@app.delete("/fundings/{funding_id}", summary="删除经费记录（兼容旧接口）")
+@app.delete("/funding/entries/{funding_id}", summary="删除经费明细")
+def delete_funding(funding_id: int, db: Session = Depends(get_db)):
+    f = db.query(Funding).filter(Funding.id == funding_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="经费记录不存在")
+    for a in db.query(FundingAttachment).filter(FundingAttachment.funding_id == f.id).all():
+        if a.file_path and os.path.exists(a.file_path):
+            try:
+                os.remove(a.file_path)
+            except Exception:
+                pass
+        db.delete(a)
+    db.delete(f)
+    db.commit()
+    _audit("admin", "DELETE /funding/entries", f"删除经费明细：{f.item_name} {f.amount}")
+    return {"message": f"经费「{f.item_name}」已删除"}
+
+
+@app.get("/fundings/stats", summary="经费统计（预算/到账/支出/结余 + 多维分布，支持时间筛选）")
+def funding_stats(start: Optional[str] = None, end: Optional[str] = None, db: Session = Depends(get_db)):
+    items = db.query(Funding).all()
+    if start or end:
+        items = [f for f in items if _date_in_range(f.fund_date, start, end)]
+    summary = _funding_summary(items)
+    summary["total_count"] = summary.pop("count")
+    by_year, by_month = {}, {}
+    by_year_expense, by_year_income, by_year_budget = {}, {}, {}
+    for f in items:
+        y = _funding_year(f)
+        if y is None:
+            continue
+        by_year[str(y)] = round(by_year.get(str(y), 0) + (f.amount or 0), 2)
+        if f.fund_type == "支出":
+            by_year_expense[str(y)] = round(by_year_expense.get(str(y), 0) + (f.amount or 0), 2)
+        elif f.fund_type == "到账":
+            by_year_income[str(y)] = round(by_year_income.get(str(y), 0) + (f.amount or 0), 2)
+        elif f.fund_type == "预算":
+            by_year_budget[str(y)] = round(by_year_budget.get(str(y), 0) + (f.amount or 0), 2)
+        m = _funding_month(f)
+        if m:
+            k = f"{y}-{int(m):02d}"
+            by_month[k] = round(by_month.get(k, 0) + (f.amount or 0), 2)
+    summary["by_year"] = by_year
+    summary["by_year_expense"] = by_year_expense
+    summary["by_year_income"] = by_year_income
+    summary["by_year_budget"] = by_year_budget
+    summary["by_month"] = by_month
+    return summary
+
+
+# ---------- 年度矩阵（透视视图，数据源 = 经费明细） ----------
 class FundingGridRowCreate(BaseModel):
     year: int
     project_id: int
@@ -3224,80 +3825,57 @@ class FundingCellSave(BaseModel):
 
 
 class FundingRowMove(BaseModel):
-    direction: str  # "up" / "down"
+    direction: str
 
 
 def _grid_att_to_dict(a: FundingAttachment) -> dict:
     return {
         "id": a.id,
+        "funding_id": a.funding_id,
         "year": a.year,
         "project_id": a.project_id,
         "month": a.month,
         "file_name": a.file_name,
-        "download_url": f"/funding-grid/attachments/{a.id}/download",
+        "download_url": f"/funding/attachments/{a.id}/download",
     }
 
 
-@app.get("/funding-grid", summary="年度经费一览表数据（行 + 单元格 + 附件 + 合同金额）")
-def get_funding_grid(year: int, db: Session = Depends(get_db)):
-    rows = (
-        db.query(FundingGridRow)
-        .filter(FundingGridRow.year == year)
-        .order_by(FundingGridRow.sort_order.asc(), FundingGridRow.id.asc())
-        .all()
-    )
-    pmap = {p.id: p.name for p in db.query(Project).all()}
-    cells = db.query(FundingCell).filter(FundingCell.year == year).all()
-    atts = db.query(FundingAttachment).filter(FundingAttachment.year == year).all()
-
-    cell_map = {}
-    for c in cells:
-        cell_map[f"{c.project_id}-{c.month}"] = {
-            "amount": c.amount,
-            "item_name": c.item_name or "",
-            "fund_date": c.fund_date or "",
-        }
-    att_map = {}
-    for a in atts:
-        att_map.setdefault(f"{a.project_id}-{a.month}", []).append(_grid_att_to_dict(a))
-
-    # ---- 合同金额（暂估/结算/到账，按 project_id × year，override 优先）----
-    override_rows = (
-        db.query(ProjectContractAmountOverride)
-        .filter(ProjectContractAmountOverride.year == year)
-        .all()
-    )
-    overrides = {(o.project_id, o.kind): o for o in override_rows}
+def _annual_contract_amounts(db: Session, year: int, project_ids: list) -> dict:
+    """年度合同金额（暂估/结算/到账）：共享合同按项目分摊；override 优先于自动值。"""
+    if not project_ids:
+        return {}
+    pids = set(project_ids)
+    contracts = db.query(Contract).all()
+    cmap = {c.id: c for c in contracts}
+    shares_map = _all_contract_shares(db)
     confirmed_docs = db.query(FinancialDoc).filter(FinancialDoc.confirmed == 1).all()
+    overrides = {(o.project_id, o.kind): o for o in
+                 db.query(ProjectContractAmountOverride).filter(ProjectContractAmountOverride.year == year).all()}
     income_fundings = db.query(Funding).filter(Funding.fund_type == "到账").all()
-    all_contracts = db.query(Contract).all()
 
-    def _year_of(doc_date_str):
-        dt = _parse_date(doc_date_str)
+    def _year_of(s):
+        dt = _parse_date(s) if s else None
         return dt.year if dt else None
 
-    def _auto_amount(pid, kind):
-        total = 0.0
-        if kind == "estimate":
-            for d in confirmed_docs:
-                if d.project_id == pid and d.doc_type == "暂估单" and _year_of(d.doc_date) == year:
-                    total += d.amount or 0
-        elif kind == "settlement":
-            for d in confirmed_docs:
-                if d.project_id == pid and d.doc_type == "结算单" and _year_of(d.doc_date) == year:
-                    total += d.amount or 0
-        else:  # income
-            for f in income_fundings:
-                if f.project_id == pid and _year_of(f.fund_date) == year:
-                    total += f.amount or 0
-        return total
+    def _doc_pid(d):
+        return d.project_id if d.project_id is not None else (cmap.get(d.contract_id).project_id if cmap.get(d.contract_id) else None)
 
-    contract_amounts: dict = {}
-    for r in rows:
-        pid = r.project_id
-        entry: dict = {}
+    out = {}
+    for pid in pids:
+        entry = {}
         for kind in AMOUNT_KINDS:
-            auto = round(_auto_amount(pid, kind), 2)
+            if kind == "estimate":
+                auto = sum(d.amount or 0 for d in confirmed_docs
+                           if d.doc_type == "暂估单" and _year_of(d.doc_date) == year
+                           and _doc_pid(d) == pid)
+            elif kind == "settlement":
+                auto = sum(d.amount or 0 for d in confirmed_docs
+                           if d.doc_type == "结算单" and _year_of(d.doc_date) == year
+                           and _doc_pid(d) == pid)
+            else:
+                auto = sum(f.amount or 0 for f in income_fundings
+                           if f.project_id == pid and _year_of(f.fund_date) == year)
+            auto = round(auto, 2)
             ov = overrides.get((pid, kind))
             if ov is not None:
                 entry[kind] = round(ov.amount or 0, 2)
@@ -3305,123 +3883,169 @@ def get_funding_grid(year: int, db: Session = Depends(get_db)):
             else:
                 entry[kind] = auto
                 entry[f"{kind}_override"] = False
-        # 合同清单：该项目全部合同，每条附本年暂估/结算金额
         clist = []
-        for c in all_contracts:
-            if c.project_id != pid:
+        for c in contracts:
+            alloc = _contract_project_allocations(c, shares_map.get(c.id))
+            share = next((amt for p, amt in alloc if p == pid), None)
+            if share is None:
                 continue
-            est = round(sum(
-                d.amount or 0 for d in confirmed_docs
-                if d.contract_id == c.id and d.doc_type == "暂估单" and _year_of(d.doc_date) == year
-            ), 2)
-            stl = round(sum(
-                d.amount or 0 for d in confirmed_docs
-                if d.contract_id == c.id and d.doc_type == "结算单" and _year_of(d.doc_date) == year
-            ), 2)
+            est = round(sum(d.amount or 0 for d in confirmed_docs
+                            if d.contract_id == c.id and _doc_pid(d) == pid
+                            and d.doc_type == "暂估单" and _year_of(d.doc_date) == year), 2)
+            stl = round(sum(d.amount or 0 for d in confirmed_docs
+                            if d.contract_id == c.id and _doc_pid(d) == pid
+                            and d.doc_type == "结算单" and _year_of(d.doc_date) == year), 2)
             clist.append({
                 "id": c.id,
-                "contract_name": c.contract_name or "",
+                "contract_name": c.contract_name or c.original_name or "",
                 "contract_no": c.contract_no or "",
-                "amount_incl_tax": round(c.amount_incl_tax or c.amount_value or 0, 2),
+                "amount_incl_tax": round(_contract_total_amount(c), 2),
+                "share_amount": round(share, 2),
+                "is_shared": len(alloc) > 1,
                 "sign_date": c.sign_date or "",
                 "estimate": est,
                 "settlement": stl,
             })
         entry["contracts"] = clist
-        contract_amounts[str(pid)] = entry
+        out[str(pid)] = entry
+    return out
 
+
+def _funding_pivot_data(db: Session, year: int, fund_type: Optional[str] = None,
+                        include_completed: bool = True) -> dict:
+    year = int(year)
+    projects = db.query(Project).all()
+    pmap = {p.id: p for p in projects}
+    completed = _completed_project_ids(db)
+
+    entries = [f for f in db.query(Funding).all() if _funding_year(f) == year]
+    if fund_type:
+        entries = [f for f in entries if (f.fund_type or "支出") == fund_type]
+
+    grid_rows = (db.query(FundingGridRow)
+                 .filter(FundingGridRow.year == year)
+                 .order_by(FundingGridRow.sort_order.asc(), FundingGridRow.id.asc()).all())
+    row_project_ids = [r.project_id for r in grid_rows]
+    for f in entries:
+        if f.project_id is not None and f.project_id not in row_project_ids:
+            row_project_ids.append(f.project_id)
+    if not include_completed:
+        row_project_ids = [pid for pid in row_project_ids if pid not in completed]
+
+    row_map = {r.project_id: r for r in grid_rows}
+    cells, att_counts = {}, {}
+    for f in entries:
+        if f.project_id is None or f.project_id not in row_project_ids:
+            continue
+        m = _funding_month(f)
+        if not m:
+            continue
+        key = f"{f.project_id}-{int(m)}"
+        cell = cells.setdefault(key, {"amount": 0.0, "count": 0, "types": {}, "categories": {}})
+        cell["amount"] = round(cell["amount"] + (f.amount or 0), 2)
+        cell["count"] += 1
+        t = f.fund_type or "其他"
+        cell["types"][t] = round(cell["types"].get(t, 0) + (f.amount or 0), 2)
+        cat = f.category or "未分类"
+        cell["categories"][cat] = round(cell["categories"].get(cat, 0) + (f.amount or 0), 2)
+
+    # 附件计数：新附件挂明细；旧附件仍按 项目+年份+月份
+    entry_map = {f.id: f for f in db.query(Funding).all()}
+    for a in db.query(FundingAttachment).filter(FundingAttachment.year == year).all():
+        pid, month = a.project_id, a.month
+        if a.funding_id and a.funding_id in entry_map:
+            f = entry_map[a.funding_id]
+            pid, month = f.project_id, _funding_month(f)
+        if pid is None or not month:
+            continue
+        key = f"{pid}-{int(month)}"
+        att_counts[key] = att_counts.get(key, 0) + 1
+
+    rows = []
+    for i, pid in enumerate(row_project_ids):
+        r = row_map.get(pid)
+        p = pmap.get(pid)
+        total = round(sum(c["amount"] for k, c in cells.items() if k.startswith(f"{pid}-")), 2)
+        rows.append({
+            "id": r.id if r is not None else 0,
+            "project_id": pid,
+            "project_name": p.name if p is not None else f"项目#{pid}",
+            "completed": int(p.completed or 0) if p is not None else 0,
+            "sort_order": r.sort_order if r is not None else (1000 + i),
+            "total": total,
+        })
+
+    by_month = {str(m): round(sum(c["amount"] for k, c in cells.items() if k.endswith(f"-{m}")), 2)
+                for m in range(1, 13)}
+    summary = {
+        "year": year,
+        "fund_type": fund_type or "全部",
+        "total": round(sum(f.amount or 0 for f in entries), 2),
+        "count": len(entries),
+        "by_month": by_month,
+        "by_type": _funding_summary(entries)["by_type"],
+        "by_category": _funding_summary(entries)["by_category"],
+    }
     return {
         "year": year,
-        "rows": [
-            {"id": r.id, "project_id": r.project_id, "project_name": pmap.get(r.project_id, f"项目#{r.project_id}")}
-            for r in rows
-        ],
-        "cells": cell_map,
-        "attachments": att_map,
-        "contract_amounts": contract_amounts,
+        "rows": rows,
+        "cells": cells,
+        "attachments": att_counts,
+        "contract_amounts": _annual_contract_amounts(db, year, row_project_ids),
+        "summary": summary,
     }
 
 
-class ContractAmountOverrideRequest(BaseModel):
-    project_id: int
-    year: int
-    kind: str
-    amount: Optional[float] = None   # None 表示删除记录，恢复自动值
+@app.get("/funding/pivot", summary="年度经费矩阵（项目×月份，数据源为经费明细）")
+def funding_pivot(year: int, fund_type: Optional[str] = None, include_completed: bool = True,
+                  db: Session = Depends(get_db)):
+    return _funding_pivot_data(db, year, fund_type, include_completed)
 
 
-@app.post("/funding-grid/contract-amount-override", summary="人工修改/重置合同金额（暂估/结算/到账，override 优先于自动值）")
-def contract_amount_override(req: ContractAmountOverrideRequest, db: Session = Depends(get_db)):
-    if req.kind not in AMOUNT_KINDS:
-        raise HTTPException(status_code=400, detail=f"kind 须为 {AMOUNT_KINDS} 之一")
-    row = (
-        db.query(ProjectContractAmountOverride)
-        .filter(
-            ProjectContractAmountOverride.project_id == req.project_id,
-            ProjectContractAmountOverride.year == req.year,
-            ProjectContractAmountOverride.kind == req.kind,
-        )
-        .first()
-    )
-    if req.amount is None:
-        if row:
-            db.delete(row)
-            db.commit()
-        return {"message": "已恢复自动值"}
-    if row:
-        row.amount = req.amount
-        row.updated_at = datetime.utcnow()
-    else:
-        db.add(ProjectContractAmountOverride(
-            project_id=req.project_id, year=req.year, kind=req.kind, amount=req.amount
-        ))
-    db.commit()
-    return {"message": "已保存"}
+@app.get("/funding-grid", summary="年度经费一览表数据（兼容旧接口，数据源为经费明细）")
+def get_funding_grid(year: int, db: Session = Depends(get_db)):
+    data = _funding_pivot_data(db, year)
+    cells = {}
+    for k, v in data["cells"].items():
+        cells[k] = {"amount": v["amount"], "item_name": "", "fund_date": "", "count": v["count"]}
+    atts = {}
+    for k, n in data["attachments"].items():
+        atts[k] = [{"id": 0, "file_name": f"附件×{n}", "download_url": ""}]
+    rows = [{"id": r["id"], "project_id": r["project_id"], "project_name": r["project_name"]}
+            for r in data["rows"]]
+    return {"year": year, "rows": rows, "cells": cells, "attachments": atts,
+            "contract_amounts": data["contract_amounts"]}
 
 
-@app.get("/funding-grid/summary", summary="项目全周期经费总览（跨年自动汇总）")
+@app.get("/funding-grid/summary", summary="项目全周期经费总览（跨年汇总，数据源为经费明细）")
 def get_funding_grid_summary(db: Session = Depends(get_db)):
-    """按项目聚合所有年度的经费金额，返回每个项目的年度分布、总计与跨年标记。
-    用于跨年项目的「全生命周期」经费视角，纯聚合查询，不影响年度矩阵。"""
     pmap = {p.id: p.name for p in db.query(Project).all()}
-    rows = db.query(FundingGridRow).all()
-    cells = db.query(FundingCell).all()
-
-    # project_id -> 出现过的年度集合（纳入一览表的行 + 有经费的单元格都算）
-    proj_years: dict = {}
-    for r in rows:
+    entries = db.query(Funding).all()
+    proj_years, yt_raw = {}, {}
+    for f in entries:
+        y = _funding_year(f)
+        if y is None or f.project_id is None:
+            continue
+        proj_years.setdefault(f.project_id, set()).add(y)
+        yt_raw[(f.project_id, y)] = yt_raw.get((f.project_id, y), 0.0) + (f.amount or 0)
+    for r in db.query(FundingGridRow).all():
         proj_years.setdefault(r.project_id, set()).add(r.year)
-    for c in cells:
-        proj_years.setdefault(c.project_id, set()).add(c.year)
-
-    # (project_id, year) -> 金额合计
-    yt_raw: dict = {}
-    for c in cells:
-        if c.amount:
-            key = (c.project_id, c.year)
-            yt_raw[key] = yt_raw.get(key, 0.0) + float(c.amount)
-
     projects = []
     for pid, ys in proj_years.items():
         ys_sorted = sorted(ys)
         yt = {str(y): round(yt_raw.get((pid, y), 0.0), 2) for y in ys_sorted}
-        total = round(sum(yt.values()), 2)
         projects.append({
-            "project_id": pid,
-            "project_name": pmap.get(pid, f"项目#{pid}"),
-            "years": ys_sorted,
-            "year_totals": yt,
-            "total": total,
-            "year_count": len(ys_sorted),
+            "project_id": pid, "project_name": pmap.get(pid, f"项目#{pid}"),
+            "years": ys_sorted, "year_totals": yt,
+            "total": round(sum(yt.values()), 2), "year_count": len(ys_sorted),
             "is_cross_year": len(ys_sorted) > 1,
         })
     projects.sort(key=lambda x: -x["total"])
-    cross = sum(1 for x in projects if x["is_cross_year"])
-    all_years = sorted({y for ys in proj_years.values() for y in ys})
     return {
         "projects": projects,
         "total_count": len(projects),
-        "cross_year_count": cross,
-        "years_all": all_years,
+        "cross_year_count": sum(1 for x in projects if x["is_cross_year"]),
+        "years_all": sorted({y for ys in proj_years.values() for y in ys}),
     }
 
 
@@ -3430,40 +4054,37 @@ def add_funding_grid_row(req: FundingGridRowCreate, db: Session = Depends(get_db
     project = db.query(Project).filter(Project.id == req.project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    exists = (
-        db.query(FundingGridRow)
-        .filter(FundingGridRow.year == req.year, FundingGridRow.project_id == req.project_id)
-        .first()
-    )
+    exists = (db.query(FundingGridRow)
+              .filter(FundingGridRow.year == req.year, FundingGridRow.project_id == req.project_id).first())
     if exists:
         raise HTTPException(status_code=400, detail="该项目已添加，请勿重复添加")
-    last = (
-        db.query(FundingGridRow)
-        .filter(FundingGridRow.year == req.year)
-        .order_by(FundingGridRow.sort_order.desc())
-        .first()
-    )
-    new_order = (last.sort_order + 1) if last else 1
-    r = FundingGridRow(year=req.year, project_id=req.project_id, sort_order=new_order)
+    last = (db.query(FundingGridRow).filter(FundingGridRow.year == req.year)
+            .order_by(FundingGridRow.sort_order.desc()).first())
+    r = FundingGridRow(year=req.year, project_id=req.project_id,
+                       sort_order=(last.sort_order + 1) if last else 1)
     db.add(r)
     db.commit()
     db.refresh(r)
     return {"id": r.id, "project_id": r.project_id, "project_name": project.name}
 
 
-@app.delete("/funding-grid/rows/{row_id}", summary="删除年度经费表项目行（连带删除其单元格与附件）")
+@app.delete("/funding-grid/rows/{row_id}", summary="删除年度经费表项目行（连带删除该年该项目的明细与附件）")
 def delete_funding_grid_row(row_id: int, db: Session = Depends(get_db)):
     r = db.query(FundingGridRow).filter(FundingGridRow.id == row_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="行不存在")
     year, pid = r.year, r.project_id
-    for a in db.query(FundingAttachment).filter(FundingAttachment.year == year, FundingAttachment.project_id == pid).all():
-        if os.path.exists(a.file_path):
+    fids = [f.id for f in db.query(Funding).filter(Funding.project_id == pid, Funding.year == year).all()]
+    for a in db.query(FundingAttachment).filter(FundingAttachment.year == year,
+                                                FundingAttachment.project_id == pid).all():
+        if a.file_path and os.path.exists(a.file_path):
             try:
                 os.remove(a.file_path)
             except Exception:
                 pass
         db.delete(a)
+    if fids:
+        db.query(Funding).filter(Funding.id.in_(fids)).delete(synchronize_session=False)
     db.query(FundingCell).filter(FundingCell.year == year, FundingCell.project_id == pid).delete()
     db.delete(r)
     db.commit()
@@ -3475,12 +4096,8 @@ def move_funding_grid_row(row_id: int, req: FundingRowMove, db: Session = Depend
     r = db.query(FundingGridRow).filter(FundingGridRow.id == row_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="行不存在")
-    siblings = (
-        db.query(FundingGridRow)
-        .filter(FundingGridRow.year == r.year)
-        .order_by(FundingGridRow.sort_order.asc(), FundingGridRow.id.asc())
-        .all()
-    )
+    siblings = (db.query(FundingGridRow).filter(FundingGridRow.year == r.year)
+                .order_by(FundingGridRow.sort_order.asc(), FundingGridRow.id.asc()).all())
     idx = next((i for i, x in enumerate(siblings) if x.id == r.id), None)
     if idx is None:
         return {"message": "ok"}
@@ -3493,31 +4110,170 @@ def move_funding_grid_row(row_id: int, req: FundingRowMove, db: Session = Depend
     return {"message": "ok"}
 
 
-@app.post("/funding-grid/cells", summary="保存单元格（项目×月份 的金额/科目/日期）")
+@app.post("/funding-grid/cells", summary="保存单元格（兼容旧接口：写入/更新一条经费明细）")
 def save_funding_cell(req: FundingCellSave, db: Session = Depends(get_db)):
     if req.month < 1 or req.month > 12:
         raise HTTPException(status_code=400, detail="月份需在 1~12 之间")
-    cell = (
-        db.query(FundingCell)
-        .filter(FundingCell.year == req.year, FundingCell.project_id == req.project_id, FundingCell.month == req.month)
-        .first()
-    )
-    amount = req.amount
-    item_name = (req.item_name or "").strip() or None
+    amount = _to_float_safe(req.amount)
+    item = (req.item_name or "").strip() or "年度经费"
     fund_date = (req.fund_date or "").strip() or None
-    if cell is None:
-        cell = FundingCell(year=req.year, project_id=req.project_id, month=req.month,
-                           amount=amount, item_name=item_name, fund_date=fund_date)
+    # 优先更新从旧单元格迁移出来的那条明细，避免重复
+    cell = (db.query(Funding)
+            .filter(Funding.project_id == req.project_id, Funding.year == req.year,
+                    Funding.month == req.month, Funding.legacy_cell_id.isnot(None))
+            .first())
+    if cell is None and amount > 0:
+        cell = Funding(project_id=req.project_id, year=req.year, month=req.month,
+                       legacy_cell_id=None, fund_type="支出", category="其他支出",
+                       source="未分类", status="已确认", remark="年度矩阵录入")
         db.add(cell)
-    else:
+    if cell is not None:
         cell.amount = amount
-        cell.item_name = item_name
+        cell.item_name = item
         cell.fund_date = fund_date
+        cell.year, cell.month = req.year, req.month
+        cell.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "已保存"}
 
 
-@app.post("/funding-grid/attachments", summary="上传单元格附件（项目×月份，可多文件）")
+# ---------- 合同-项目分摊 ----------
+class ContractShareItem(BaseModel):
+    project_id: int
+    amount: Optional[float] = None
+    ratio: Optional[float] = None
+    remark: Optional[str] = None
+
+
+class ContractSharesSave(BaseModel):
+    shares: List[ContractShareItem] = []
+
+
+def _contract_share_payload(db: Session, c: Contract) -> dict:
+    shares = _all_contract_shares(db, [c.id]).get(c.id, [])
+    alloc = _contract_project_allocations(c, shares)
+    pmap = {p.id: p.name for p in db.query(Project).all()}
+    total = _contract_total_amount(c)
+    raw_sum = round(sum((s.amount if s.amount is not None else (s.ratio or 0) * total)
+                        for s in shares), 2) if shares else 0.0
+    return {
+        "contract_id": c.id,
+        "contract_name": c.contract_name or c.original_name or "",
+        "contract_no": c.contract_no or "",
+        "project_id": c.project_id,
+        "project_name": pmap.get(c.project_id, ""),
+        "total": round(total, 2),
+        "confirmed": c.confirmed or 0,
+        "shares": [{
+            "id": s.id, "project_id": s.project_id,
+            "project_name": pmap.get(s.project_id, f"项目#{s.project_id}"),
+            "amount": round(s.amount, 2) if s.amount is not None else None,
+            "ratio": s.ratio, "remark": s.remark or "",
+        } for s in shares],
+        "allocations": [
+            {"project_id": pid, "project_name": pmap.get(pid, f"项目#{pid}"), "amount": round(amt, 2)}
+            for pid, amt in alloc
+        ],
+        "raw_share_sum": raw_sum,
+        "unallocated": round(total - raw_sum, 2) if shares else 0.0,
+        "is_shared": len(alloc) > 1,
+    }
+
+
+@app.get("/funding/contracts", summary="合同分摊总览")
+def funding_contracts(project_id: Optional[int] = None, only_shared: bool = False,
+                      db: Session = Depends(get_db)):
+    contracts = db.query(Contract).order_by(Contract.created_at.desc()).all()
+    items = [_contract_share_payload(db, c) for c in contracts]
+    if project_id is not None:
+        items = [x for x in items if any(a["project_id"] == project_id for a in x["allocations"])]
+    if only_shared:
+        items = [x for x in items if x["is_shared"]]
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/contracts/{contract_id}/shares", summary="查看合同分摊")
+def get_contract_shares(contract_id: int, db: Session = Depends(get_db)):
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="合同不存在")
+    return _contract_share_payload(db, c)
+
+
+@app.put("/contracts/{contract_id}/shares", summary="保存合同分摊（整体替换；未分完余额自动归主项目）")
+def save_contract_shares(contract_id: int, req: ContractSharesSave, db: Session = Depends(get_db)):
+    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="合同不存在")
+    total = _contract_total_amount(c)
+    seen, cleaned, raw_sum = set(), [], 0.0
+    for s in (req.shares or []):
+        if s.project_id in seen:
+            raise HTTPException(status_code=400, detail="同一项目不能重复分摊")
+        seen.add(s.project_id)
+        p = db.query(Project).filter(Project.id == s.project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail=f"项目 #{s.project_id} 不存在")
+        amt = s.amount if s.amount is not None else ((s.ratio or 0) * total)
+        amt = _to_float_safe(amt)
+        if amt < 0:
+            raise HTTPException(status_code=400, detail="分摊金额不能为负数")
+        raw_sum += amt
+        cleaned.append(ContractProjectShare(
+            contract_id=c.id, project_id=s.project_id, amount=round(amt, 2),
+            ratio=(round(amt / total, 6) if total else s.ratio),
+            remark=(s.remark or "").strip() or None,
+        ))
+    if cleaned and raw_sum > total + 0.01:
+        raise HTTPException(status_code=400,
+                            detail=f"分摊合计 {raw_sum:,.2f} 超过合同含税总额 {total:,.2f}，请调整")
+    db.query(ContractProjectShare).filter(ContractProjectShare.contract_id == c.id).delete()
+    for row in cleaned:
+        db.add(row)
+    db.commit()
+    _audit("admin", f"PUT /contracts/{contract_id}/shares",
+           f"保存合同分摊：{len(cleaned)} 个项目，合计 {raw_sum:,.2f} / 合同 {total:,.2f}")
+    return _contract_share_payload(db, c)
+
+
+# ---------- 经费附件 ----------
+def _save_funding_attachment(db: Session, year: int, project_id: int, month: int,
+                             funding_id: Optional[int], f: UploadFile) -> dict:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    ext = os.path.splitext(f.filename)[1]
+    stored = f"funding_{ts}{ext}"
+    path = os.path.join(UPLOAD_DIR, stored)
+    with open(path, "wb") as buf:
+        shutil.copyfileobj(f.file, buf)
+    a = FundingAttachment(funding_id=funding_id, year=year, project_id=project_id,
+                          month=month, file_name=f.filename, file_path=path)
+    db.add(a)
+    db.commit()
+    db.refresh(a)
+    return _grid_att_to_dict(a)
+
+
+@app.post("/funding/entries/{entry_id}/attachments", summary="为经费明细上传附件（可多文件）")
+async def upload_funding_entry_attachments(
+    entry_id: int,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    f = db.query(Funding).filter(Funding.id == entry_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="经费明细不存在")
+    results, errors = [], []
+    year, month = _funding_year(f) or date.today().year, _funding_month(f) or 1
+    for uf in files:
+        try:
+            results.append(_save_funding_attachment(db, year, f.project_id, month, f.id, uf))
+        except Exception as e:
+            db.rollback()
+            errors.append({"filename": uf.filename, "error": str(e)})
+    return {"uploaded": results, "errors": errors}
+
+
+@app.post("/funding-grid/attachments", summary="上传年度矩阵附件（兼容旧接口：项目+月份）")
 async def upload_funding_attachments(
     year: int = Form(...),
     project_id: int = Form(...),
@@ -3526,27 +4282,17 @@ async def upload_funding_attachments(
     db: Session = Depends(get_db),
 ):
     results, errors = [], []
-    for f in files:
+    for uf in files:
         try:
-            ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-            ext = os.path.splitext(f.filename)[1]
-            stored = f"funding_{ts}{ext}"
-            path = os.path.join(UPLOAD_DIR, stored)
-            with open(path, "wb") as buf:
-                shutil.copyfileobj(f.file, buf)
-            a = FundingAttachment(year=year, project_id=project_id, month=month,
-                                  file_name=f.filename, file_path=path)
-            db.add(a)
-            db.commit()
-            db.refresh(a)
-            results.append(_grid_att_to_dict(a))
+            results.append(_save_funding_attachment(db, year, project_id, month, None, uf))
         except Exception as e:
             db.rollback()
-            errors.append({"filename": f.filename, "error": str(e)})
+            errors.append({"filename": uf.filename, "error": str(e)})
     return {"uploaded": results, "errors": errors}
 
 
-@app.get("/funding-grid/attachments/{att_id}/download", summary="下载单元格附件")
+@app.get("/funding/attachments/{att_id}/download", summary="下载经费附件")
+@app.get("/funding-grid/attachments/{att_id}/download", summary="下载经费附件（兼容旧路径）")
 def download_funding_attachment(att_id: int, db: Session = Depends(get_db)):
     a = db.query(FundingAttachment).filter(FundingAttachment.id == att_id).first()
     if not a:
@@ -3556,7 +4302,8 @@ def download_funding_attachment(att_id: int, db: Session = Depends(get_db)):
     return FileResponse(path=a.file_path, filename=a.file_name, media_type="application/octet-stream")
 
 
-@app.delete("/funding-grid/attachments/{att_id}", summary="删除单元格附件")
+@app.delete("/funding/attachments/{att_id}", summary="删除经费附件")
+@app.delete("/funding-grid/attachments/{att_id}", summary="删除经费附件（兼容旧路径）")
 def delete_funding_attachment(att_id: int, db: Session = Depends(get_db)):
     a = db.query(FundingAttachment).filter(FundingAttachment.id == att_id).first()
     if not a:
@@ -3569,6 +4316,539 @@ def delete_funding_attachment(att_id: int, db: Session = Depends(get_db)):
     db.delete(a)
     db.commit()
     return {"message": "附件已删除"}
+
+
+# ---------- 年度逐项核对（核心：确保每年研发投入正确） ----------
+def _doc_year(d: FinancialDoc):
+    dt = _parse_date(d.doc_date) if d.doc_date else None
+    return dt.year if dt else None
+
+
+def _doc_project_id(d: FinancialDoc, cmap: dict):
+    c = cmap.get(d.contract_id)
+    return d.project_id if d.project_id is not None else (c.project_id if c is not None else None)
+
+
+def _reconcile_funding(db: Session, year: int, project_id: Optional[int] = None) -> dict:
+    """逐项核对：合同分摊 ↔ 财务单据 ↔ 经费台账 ↔ 年度归属。
+
+    返回可复现的规则引擎结果（不调用 AI），供「一键智能核对」和「一键修复」使用。
+    """
+    year = int(year)
+    projects = db.query(Project).all()
+    pmap = {p.id: p for p in projects}
+    contracts = db.query(Contract).all()
+    cmap = {c.id: c for c in contracts}
+    shares_map = _all_contract_shares(db)
+    alloc_map = {c.id: _contract_project_allocations(c, shares_map.get(c.id)) for c in contracts}
+    completed_ids = _completed_project_ids(db)
+
+    all_docs = db.query(FinancialDoc).filter(FinancialDoc.confirmed == 1).all()
+    all_entries = db.query(Funding).all()
+    docs = [d for d in all_docs if _doc_year(d) == year]
+    entries = [f for f in all_entries if _funding_year(f) == year]
+
+    if project_id is not None:
+        docs = [d for d in docs if _doc_project_id(d, cmap) == project_id]
+        entries = [f for f in entries if f.project_id == project_id]
+
+    issues = []
+
+    def add_issue(level, code, title, detail, **kw):
+        issues.append({
+            "level": level, "code": code, "title": title, "detail": detail,
+            "project_id": kw.get("project_id"), "project_name": pmap.get(kw.get("project_id")).name
+            if pmap.get(kw.get("project_id")) else "",
+            "contract_id": kw.get("contract_id"), "doc_id": kw.get("doc_id"),
+            "funding_id": kw.get("funding_id"), "suggestion": kw.get("suggestion", ""),
+            "auto_fixable": bool(kw.get("auto_fixable", False)),
+        })
+
+    # 1) 年度/月份/分类/来源等基础数据质量
+    for f in all_entries:
+        if project_id is not None and f.project_id != project_id:
+            continue
+        y, m = _funding_year(f), _funding_month(f)
+        if y is None:
+            add_issue("warning", "YEAR_MISSING", "经费明细未归属年度",
+                      f"#{f.id}「{f.item_name}」金额 {f.amount or 0:,.2f}，缺发生日期/年度",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="补发生日期，或手工指定年度/月份",
+                      auto_fixable=bool(_parse_date(f.fund_date or "")))
+        elif y == year and f.month is None and _parse_date(f.fund_date or ""):
+            add_issue("info", "MONTH_MISSING", "经费明细缺月份",
+                      f"#{f.id}「{f.item_name}」未填月份，年度矩阵不计入该月",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="按发生日期自动补月份", auto_fixable=True)
+        if y == year and f.month and m and f.month != m:
+            add_issue("warning", "PERIOD_MISMATCH", "年度/月份与发生日期不一致",
+                      f"#{f.id}「{f.item_name}」标注 {f.year}-{f.month}，发生日期 {f.fund_date}",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="按发生日期自动修正年度/月份", auto_fixable=True)
+        if not f.category or f.category == "未分类":
+            add_issue("info", "CATEGORY_MISSING", "经费明细未分类",
+                      f"#{f.id}「{f.item_name}」缺经费科目分类",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="补为「其他支出」后可手工调整", auto_fixable=True)
+        if not f.source or f.source == "未分类":
+            add_issue("info", "SOURCE_MISSING", "经费明细未填经费来源",
+                      f"#{f.id}「{f.item_name}」缺经费来源",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="补为「其他」后可手工调整", auto_fixable=True)
+        if (f.amount or 0) <= 0:
+            add_issue("danger", "AMOUNT_INVALID", "经费明细金额无效",
+                      f"#{f.id}「{f.item_name}」金额为 {f.amount or 0}",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="修改为大于 0 的金额")
+        if y == year and not f.contract_id:
+            add_issue("info", "ENTRY_NO_CONTRACT", "经费明细未关联合同",
+                      f"#{f.id}「{f.item_name}」金额 {f.amount or 0:,.2f}，无法与合同/单据逐项比对",
+                      project_id=f.project_id, funding_id=f.id,
+                      suggestion="补充关联合同；确属无合同支出可忽略")
+
+    # 2) 单据年度归属
+    for d in all_docs:
+        if project_id is not None and _doc_project_id(d, cmap) != project_id:
+            continue
+        if _doc_year(d) is None:
+            add_issue("warning", "DOC_DATE_MISSING", "财务单据缺发生日期",
+                      f"#{d.id}「{d.original_name}」{d.doc_type} 金额 {d.amount or 0:,.2f}",
+                      project_id=_doc_project_id(d, cmap), contract_id=d.contract_id, doc_id=d.id,
+                      suggestion="补填发生日期后归档到对应年度")
+
+    # 3) 单据 ↔ 台账 逐项匹配（优先同合同+同项目+同年度+金额一致；其次同项目+同金额兜底，避免重复补录）
+    def _key(contract_id, pid, amount):
+        return (contract_id, pid, round(float(amount or 0), 2))
+
+    def _loose(pid, amount):
+        return (pid, round(float(amount or 0), 2))
+
+    docs_by_key: dict = {}
+    docs_by_loose: dict = {}
+    for d in docs:
+        pid = _doc_project_id(d, cmap)
+        docs_by_key.setdefault(_key(d.contract_id, pid, d.amount), []).append(d)
+        docs_by_loose.setdefault(_loose(pid, d.amount), []).append(d)
+    matched_doc_ids, matched_entry_ids = set(), set()
+    linkable_entry_ids, entry_doc_match = set(), {}
+    for f in entries:
+        if f.fund_type != "支出":
+            continue
+        candidates = []
+        if f.contract_id:
+            candidates = [d for d in docs_by_key.get(_key(f.contract_id, f.project_id, f.amount), [])
+                          if d.id not in matched_doc_ids]
+        if not candidates:
+            candidates = [d for d in docs_by_loose.get(_loose(f.project_id, f.amount), [])
+                          if d.id not in matched_doc_ids]
+        if candidates:
+            d = candidates[0]
+            matched_doc_ids.add(d.id)
+            matched_entry_ids.add(f.id)
+            entry_doc_match[f.id] = d.id
+            if not f.contract_id:
+                linkable_entry_ids.add(f.id)
+            if f.contract_id and d.contract_id and d.contract_id != f.contract_id:
+                add_issue("warning", "CONTRACT_MISMATCH", "台账与单据的关联合同不一致",
+                          f"台账 #{f.id}「{f.item_name}」关联合同 #{f.contract_id}，"
+                          f"单据 #{d.id}「{d.original_name}」关联合同 #{d.contract_id}",
+                          project_id=f.project_id, contract_id=f.contract_id, funding_id=f.id,
+                          suggestion="将台账或单据的合同改为同一份，确保逐项可追溯")
+            continue
+        if f.contract_id:
+            add_issue("warning", "ENTRY_NO_DOC", "台账支出无对应财务单据",
+                      f"#{f.id}「{f.item_name}」{f.amount or 0:,.2f}，合同「{(cmap.get(f.contract_id).contract_name if cmap.get(f.contract_id) else '')}」",
+                      project_id=f.project_id, contract_id=f.contract_id, funding_id=f.id,
+                      suggestion="补充暂估/结算/发票单据并确认；若为无票支出可保留说明")
+    for d in docs:
+        if d.id in matched_doc_ids:
+            continue
+        pid = _doc_project_id(d, cmap)
+        if d.amount and d.amount > 0:
+            add_issue("danger", "DOC_NOT_BOOKED", "财务单据未入经费台账",
+                      f"#{d.id}「{d.original_name}」{d.doc_type} 金额 {d.amount:,.2f}，项目「{pmap.get(pid).name if pmap.get(pid) else '未指定'}」",
+                      project_id=pid, contract_id=d.contract_id, doc_id=d.id,
+                      suggestion="一键生成台账草稿（金额/日期/合同自动带入）", auto_fixable=True)
+
+    # 能按单据自动关联合同的台账，标记为可一键修复
+    if linkable_entry_ids:
+        for it in issues:
+            if it["code"] == "ENTRY_NO_CONTRACT" and it.get("funding_id") in linkable_entry_ids:
+                it["auto_fixable"] = True
+                it["suggestion"] = "一键按匹配到的财务单据关联合同"
+
+    # 4) 共享合同：单据必须明确项目，否则无法分摊
+    for d in docs:
+        c = cmap.get(d.contract_id)
+        if c is None:
+            continue
+        alloc = alloc_map.get(c.id, [])
+        if len(alloc) > 1 and d.project_id is None:
+            add_issue("warning", "SHARED_DOC_NO_PROJECT", "共享合同单据未指定归属项目",
+                      f"#{d.id}「{d.original_name}」合同被 {len(alloc)} 个项目共用，单据未指定项目",
+                      project_id=c.project_id, contract_id=c.id, doc_id=d.id,
+                      suggestion="在财务单据中把项目改为实际承担项目，或补合同分摊")
+
+    # 5) 合同分摊完整性 / 超额
+    for c in contracts:
+        if project_id is not None and project_id not in [p for p, _ in alloc_map.get(c.id, [])]:
+            continue
+        total = _contract_total_amount(c)
+        raw = shares_map.get(c.id, [])
+        raw_sum = round(sum((s.amount if s.amount is not None else (s.ratio or 0) * total)
+                            for s in raw), 2) if raw else 0.0
+        alloc = alloc_map.get(c.id, [])
+        if raw and raw_sum > total + 0.01:
+            add_issue("danger", "SHARE_OVER", "合同分摊合计超过合同总额",
+                      f"合同「{c.contract_name or c.original_name}」分摊 {raw_sum:,.2f} > 合同 {total:,.2f}",
+                      project_id=c.project_id, contract_id=c.id,
+                      suggestion="调整分摊金额，确保合计不超过合同总额")
+        elif raw and raw_sum < total - 0.01:
+            add_issue("info", "SHARE_REMAINDER", "合同分摊未分完，余额自动归主项目",
+                      f"合同「{c.contract_name or c.original_name}」已分 {raw_sum:,.2f}，合同 {total:,.2f}，"
+                      f"余额 {total - raw_sum:,.2f} 归主项目「{pmap.get(c.project_id).name if pmap.get(c.project_id) else '—'}」",
+                      project_id=c.project_id, contract_id=c.id,
+                      suggestion="如需调整，请在「合同分摊」中修改各项目金额")
+        # 台账金额超分摊额
+        for pid, share in alloc:
+            if project_id is not None and pid != project_id:
+                continue
+            ledger = round(sum(f.amount or 0 for f in entries
+                               if f.contract_id == c.id and f.project_id == pid
+                               and f.fund_type == "支出"), 2)
+            if share > 0 and ledger > share + 0.01:
+                add_issue("warning", "LEDGER_OVER_SHARE", "项目台账金额超过合同分摊额",
+                          f"项目「{pmap.get(pid).name if pmap.get(pid) else pid}」合同「{c.contract_name or c.original_name}」"
+                          f"台账 {ledger:,.2f} > 分摊 {share:,.2f}",
+                          project_id=pid, contract_id=c.id,
+                          suggestion="核对是否把其他合同支出记到本项目，或调整分摊")
+
+    # 6) 疑似重复合同（同编号，或同名同金额）
+    groups = {}
+    for c in contracts:
+        no = (c.contract_no or "").strip().lower()
+        name = re.sub(r"\s+", "", (c.contract_name or c.original_name or "")).lower()
+        key = no or f"{name}|{round(_contract_total_amount(c), 2)}"
+        if key:
+            groups.setdefault(key, []).append(c)
+    for key, cs in groups.items():
+        if len(cs) > 1:
+            ids = "、".join(f"#{x.id}" for x in cs)
+            for c in cs:
+                add_issue("warning", "DUPLICATE_CONTRACT", "疑似重复合同",
+                          f"合同「{c.contract_name or c.original_name}」与 {ids} 同编号/同名同额，可能被重复计入",
+                          project_id=c.project_id, contract_id=c.id,
+                          suggestion="在「合同管理 → 查重去重」中合并或删除重复记录")
+
+    # 7) 年度项目汇总（研发投入正确性的主表）
+    annual = {}
+    for p in projects:
+        if project_id is not None and p.id != project_id:
+            continue
+        annual[p.id] = {
+            "project_id": p.id, "project_name": p.name,
+            "completed": int(p.completed or 0),
+            "contract_amount": round(sum(amt for pid, amt in
+                                         (a for c in contracts for a in alloc_map.get(c.id, [])) if pid == p.id), 2),
+            "budget": 0.0, "income": 0.0, "expense": 0.0,
+            "verified_expense": 0.0, "unsupported_expense": 0.0,
+            "doc_estimate": 0.0, "doc_settlement": 0.0, "doc_invoice": 0.0,
+            "doc_effective": 0.0, "diff": 0.0, "entry_count": 0, "doc_count": 0,
+            "status": "无数据",
+        }
+    # 平台级（project_id=None）单列
+    if project_id is None:
+        annual[0] = {
+            "project_id": 0, "project_name": "平台级（未关联项目）", "completed": 0,
+            "contract_amount": 0.0, "budget": 0.0, "income": 0.0, "expense": 0.0,
+            "verified_expense": 0.0, "unsupported_expense": 0.0,
+            "doc_estimate": 0.0, "doc_settlement": 0.0, "doc_invoice": 0.0,
+            "doc_effective": 0.0, "diff": 0.0, "entry_count": 0, "doc_count": 0,
+            "status": "无数据",
+        }
+
+    def A(pid):
+        return annual.setdefault(pid or 0, annual.get(0))
+
+    for f in entries:
+        a = A(f.project_id)
+        if a is None:
+            continue
+        amt = f.amount or 0
+        a["entry_count"] += 1
+        if f.fund_type == "预算":
+            a["budget"] += amt
+        elif f.fund_type == "到账":
+            a["income"] += amt
+        else:
+            a["expense"] += amt
+            if f.id in matched_entry_ids:
+                a["verified_expense"] += amt
+    for d in docs:
+        pid = _doc_project_id(d, cmap) or 0
+        a = annual.get(pid)
+        if a is None:
+            continue
+        a["doc_count"] += 1
+        amt = d.amount or 0
+        if d.doc_type == "暂估单":
+            a["doc_estimate"] += amt
+        elif d.doc_type == "结算单":
+            a["doc_settlement"] += amt
+        else:
+            a["doc_invoice"] += amt
+    for c in contracts:
+        for pid, _share in alloc_map.get(c.id, []):
+            a = annual.get(pid)
+            if a is None:
+                continue
+            dlist = [d for d in docs if d.contract_id == c.id and _doc_project_id(d, cmap) == pid]
+            est = sum(d.amount or 0 for d in dlist if d.doc_type == "暂估单")
+            stl = sum(d.amount or 0 for d in dlist if d.doc_type == "结算单")
+            inv = sum(d.amount or 0 for d in dlist if d.doc_type == "发票")
+            a["doc_effective"] += inv if inv > 0 else (stl if stl > 0 else est)
+
+    annual_rows = []
+    for a in annual.values():
+        for k in ("contract_amount", "budget", "income", "expense", "verified_expense",
+                  "doc_estimate", "doc_settlement", "doc_invoice", "doc_effective"):
+            a[k] = round(a[k], 2)
+        a["unsupported_expense"] = round(max(0.0, a["expense"] - a["verified_expense"]), 2)
+        a["diff"] = round(a["expense"] - a["doc_effective"], 2)
+        if a["expense"] <= 0 and a["doc_effective"] <= 0 and a["income"] <= 0 and a["budget"] <= 0:
+            a["status"] = "无数据"
+        elif a["unsupported_expense"] > 0.01:
+            a["status"] = "待补单据"
+        elif abs(a["diff"]) > 0.01:
+            a["status"] = "有差异"
+        else:
+            a["status"] = "一致"
+        if a["project_id"] == 0 and a["expense"] <= 0 and a["doc_effective"] <= 0:
+            continue
+        annual_rows.append(a)
+    annual_rows.sort(key=lambda x: (x["project_id"] == 0, -x["expense"]))
+
+    # 8) 合同 × 项目逐项比对表
+    entry_by_id = {f.id: f for f in entries}
+    doc_by_id = {d.id: d for d in docs}
+    linkable_amounts: dict = {}
+    for fid in linkable_entry_ids:
+        f = entry_by_id.get(fid)
+        d = doc_by_id.get(entry_doc_match.get(fid))
+        if f and d:
+            key = (d.contract_id, f.project_id)
+            linkable_amounts[key] = round(linkable_amounts.get(key, 0.0) + (f.amount or 0), 2)
+
+    item_rows = []
+    for c in contracts:
+        alloc = alloc_map.get(c.id, [])
+        if project_id is not None:
+            alloc = [(pid, amt) for pid, amt in alloc if pid == project_id]
+        if not alloc:
+            continue
+        for pid, share in alloc:
+            dlist = [d for d in docs if d.contract_id == c.id and _doc_project_id(d, cmap) == pid]
+            elist = [f for f in entries if f.contract_id == c.id and f.project_id == pid]
+            est = sum(d.amount or 0 for d in dlist if d.doc_type == "暂估单")
+            stl = sum(d.amount or 0 for d in dlist if d.doc_type == "结算单")
+            inv = sum(d.amount or 0 for d in dlist if d.doc_type == "发票")
+            eff = inv if inv > 0 else (stl if stl > 0 else est)
+            ledger_exp = sum(f.amount or 0 for f in elist if f.fund_type == "支出")
+            ledger_inc = sum(f.amount or 0 for f in elist if f.fund_type == "到账")
+            pending_link = linkable_amounts.get((c.id, pid), 0.0) if ledger_exp <= 0.01 else 0.0
+            diff = ledger_exp - eff
+            if pending_link > 0.01:
+                status = "待关联合同"
+            elif ledger_exp <= 0 and eff <= 0:
+                status = "无数据"
+            elif abs(diff) <= 0.01:
+                status = "一致"
+            elif ledger_exp > eff:
+                status = "台账多记"
+            else:
+                status = "台账少记"
+            item_rows.append({
+                "project_id": pid,
+                "project_name": pmap.get(pid).name if pmap.get(pid) else f"项目#{pid}",
+                "completed": int(pmap.get(pid).completed or 0) if pmap.get(pid) else 0,
+                "contract_id": c.id,
+                "contract_name": c.contract_name or c.original_name or "",
+                "contract_no": c.contract_no or "",
+                "contract_total": round(_contract_total_amount(c), 2),
+                "share_amount": round(share, 2),
+                "is_shared": len(alloc_map.get(c.id, [])) > 1,
+                "estimate": round(est, 2),
+                "settlement": round(stl, 2),
+                "invoice": round(inv, 2),
+                "doc_effective": round(eff, 2),
+                "ledger_expense": round(ledger_exp, 2),
+                "ledger_income": round(ledger_inc, 2),
+                "pending_link": round(pending_link, 2),
+                "diff": round(diff, 2),
+                "status": status,
+            })
+    # 未关联合同的台账支出：单列一行，避免年度合计漏项（可一键关联单据的除外）
+    unlinked = [f for f in entries if not f.contract_id and f.fund_type == "支出"
+                and f.id not in linkable_entry_ids]
+    if unlinked:
+        by_pid = {}
+        for f in unlinked:
+            by_pid.setdefault(f.project_id or 0, 0.0)
+            by_pid[f.project_id or 0] += f.amount or 0
+        for pid, amt in by_pid.items():
+            p = pmap.get(pid)
+            item_rows.append({
+                "project_id": pid, "project_name": p.name if p else "平台级（未关联项目）",
+                "completed": int(p.completed or 0) if p else 0,
+                "contract_id": None, "contract_name": "（未关联合同）", "contract_no": "",
+                "contract_total": 0.0, "share_amount": 0.0, "is_shared": False,
+                "estimate": 0.0, "settlement": 0.0, "invoice": 0.0, "doc_effective": 0.0,
+                "ledger_expense": round(amt, 2), "ledger_income": 0.0,
+                "pending_link": 0.0,
+                "diff": round(amt, 2), "status": "无合同",
+            })
+    item_rows.sort(key=lambda x: (x["project_id"], x["contract_id"] or 0))
+
+    danger = sum(1 for i in issues if i["level"] == "danger")
+    warning = sum(1 for i in issues if i["level"] == "warning")
+    info = sum(1 for i in issues if i["level"] == "info")
+    auto_fixable = sum(1 for i in issues if i["auto_fixable"])
+    total_expense = round(sum(a["expense"] for a in annual_rows), 2)
+    total_verified = round(sum(a["verified_expense"] for a in annual_rows), 2)
+    total_doc_eff = round(sum(a["doc_effective"] for a in annual_rows), 2)
+    summary = {
+        "year": year,
+        "project_id": project_id,
+        "total_expense": total_expense,
+        "total_verified": total_verified,
+        "total_unsupported": round(max(0.0, total_expense - total_verified), 2),
+        "total_income": round(sum(a["income"] for a in annual_rows), 2),
+        "total_budget": round(sum(a["budget"] for a in annual_rows), 2),
+        "total_doc_effective": total_doc_eff,
+        "diff": round(total_expense - total_doc_eff, 2),
+        "contract_amount": round(sum(a["contract_amount"] for a in annual_rows), 2),
+        "project_count": len([a for a in annual_rows if a["project_id"] != 0]),
+        "completed_count": len([a for a in annual_rows if a["completed"]]),
+        "issue_count": len(issues),
+        "danger_count": danger,
+        "warning_count": warning,
+        "info_count": info,
+        "auto_fixable": auto_fixable,
+        "matched_count": len(matched_entry_ids),
+        "doc_count": len(docs),
+        "entry_count": len(entries),
+        "status": "通过" if (danger + warning) == 0 else ("待处理" if danger else "有提醒"),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    issues.sort(key=lambda x: ({"danger": 0, "warning": 1, "info": 2}.get(x["level"], 3), x["code"]))
+    return {
+        "summary": summary,
+        "annual_rows": annual_rows,
+        "item_rows": item_rows,
+        "issues": issues,
+    }
+
+
+@app.get("/funding/reconcile", summary="年度经费逐项核对（合同分摊↔财务单据↔经费台账↔年度归属）")
+def funding_reconcile(year: int, project_id: Optional[int] = None, db: Session = Depends(get_db)):
+    return _reconcile_funding(db, year, project_id)
+
+
+@app.get("/funding/annual", summary="年度研发投入汇总（核对结果的项目维度）")
+def funding_annual(year: int, db: Session = Depends(get_db)):
+    data = _reconcile_funding(db, year, None)
+    return {"summary": data["summary"], "annual_rows": data["annual_rows"]}
+
+
+class ReconcileApplyRequest(BaseModel):
+    year: int
+    project_id: Optional[int] = None
+    fix_period: bool = True
+    fill_classification: bool = True
+    link_contract_from_docs: bool = True
+    create_entries_from_docs: bool = False
+
+
+@app.post("/funding/reconcile/apply", summary="一键修复可自动处理的核对问题（年度归属/分类/单据补录/关联合同）")
+def funding_reconcile_apply(req: ReconcileApplyRequest, db: Session = Depends(get_db)):
+    year = int(req.year)
+    entries = db.query(Funding).filter(or_(Funding.year == year,
+                                           and_(Funding.year.is_(None), Funding.fund_date.like(f"{year}%")))).all()
+    if req.project_id is not None:
+        entries = [f for f in entries if f.project_id == req.project_id]
+    fixed_period, filled_class, linked, created = 0, 0, 0, 0
+    for f in entries:
+        dt = _parse_date(f.fund_date) if f.fund_date else None
+        if req.fix_period and dt:
+            if f.year != dt.year or f.month != dt.month:
+                f.year, f.month = dt.year, dt.month
+                fixed_period += 1
+        if req.fill_classification:
+            changed = False
+            if not f.category or f.category == "未分类":
+                f.category = "其他支出"
+                changed = True
+            if not f.source or f.source == "未分类":
+                f.source = "其他"
+                changed = True
+            if changed:
+                filled_class += 1
+
+    # 一键按匹配到的财务单据补关联合同：解决“台账有金额但没挂合同”导致无法逐项比对的问题
+    if req.link_contract_from_docs:
+        data = _reconcile_funding(db, year, req.project_id)
+        linkable = {i["funding_id"] for i in data["issues"]
+                    if i["code"] == "ENTRY_NO_CONTRACT" and i.get("auto_fixable") and i.get("funding_id")}
+        docs = db.query(FinancialDoc).filter(FinancialDoc.confirmed == 1).all()
+        cmap = {c.id: c for c in db.query(Contract).all()}
+        for f in entries:
+            if f.id not in linkable or f.contract_id:
+                continue
+            for d in docs:
+                if d.amount and abs((d.amount or 0) - (f.amount or 0)) <= 0.01 \
+                        and _doc_project_id(d, cmap) == f.project_id:
+                    f.contract_id = d.contract_id
+                    linked += 1
+                    break
+
+    if req.create_entries_from_docs:
+        # 关联合同后重新核对，避免把已经能匹配的台账误判为“单据未入账”
+        data = _reconcile_funding(db, year, req.project_id)
+        unbooked_doc_ids = [i["doc_id"] for i in data["issues"]
+                            if i["code"] == "DOC_NOT_BOOKED" and i.get("doc_id")]
+        for did in unbooked_doc_ids:
+            d = db.query(FinancialDoc).filter(FinancialDoc.id == did).first()
+            if not d or not d.amount or d.amount <= 0:
+                continue
+            exists = db.query(Funding).filter(Funding.voucher_no == f"DOC-{d.id}").first()
+            if exists:
+                continue
+            c = db.query(Contract).filter(Contract.id == d.contract_id).first()
+            pid = d.project_id if d.project_id is not None else (c.project_id if c else None)
+            if c is not None:
+                alloc_pids = [p for p, _amt in _contract_project_allocations(c, _all_contract_shares(db).get(c.id))]
+                if pid is not None and pid not in alloc_pids:
+                    continue
+            dt = _parse_date(d.doc_date) if d.doc_date else None
+            f = Funding(
+                project_id=pid, contract_id=d.contract_id,
+                item_name=f"{d.doc_type}：{d.original_name}"[:200],
+                fund_type="支出", amount=d.amount,
+                fund_date=d.doc_date or None,
+                year=(dt.year if dt else year), month=(dt.month if dt else None),
+                category="其他支出", source="未分类", voucher_no=f"DOC-{d.id}",
+                status="已确认", remark="一键对账补录（来源：财务单据）",
+            )
+            db.add(f)
+            created += 1
+    db.commit()
+    _audit("admin", "POST /funding/reconcile/apply",
+           f"{year} 年一键修复：年度归属 {fixed_period}，分类 {filled_class}，关联合同 {linked}，单据补录 {created}")
+    return {
+        "message": f"已修正年度归属 {fixed_period} 条、补分类 {filled_class} 条、关联合同 {linked} 条、补录单据 {created} 条",
+        "fixed_period": fixed_period, "filled_class": filled_class,
+        "linked_contracts": linked, "created_entries": created,
+    }
 
 
 # ============ 财务资料（暂估单 / 结算单 / 发票） ============
@@ -3673,7 +4953,7 @@ def _extract_financial_doc_fields(content: str, filename: str = "") -> dict:
         "max_tokens": 600,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=90)
+    resp = post_deepseek(payload, module="financial_extract", scan_text=text_part, filename=filename, timeout=90)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -3735,6 +5015,14 @@ def _process_financial_doc_async(doc_id: int, file_path: str, original_name: str
         if content and content.strip():
             try:
                 fields = _extract_financial_doc_fields(content, original_name)
+            except AIBlocked as e:
+                d0 = db.query(FinancialDoc).filter(FinancialDoc.id == doc_id).first()
+                if d0 is not None:
+                    d0.remark = f"AI合规拦截：{e}"
+                    d0.confirmed = 0
+                    db.commit()
+                logger.warning(f"[财务单据后台] AI 合规拦截 {original_name}：{e}")
+                return
             except Exception as e:
                 logger.error(f"[财务单据后台] 抽取字段失败 {original_name}：{e}")
 
@@ -3778,6 +5066,12 @@ async def upload_financial_docs(
         raise HTTPException(status_code=404, detail="关联合同不存在")
     if doc_type not in FINANCIAL_DOC_TYPES:
         raise HTTPException(status_code=400, detail=f"单据类型须为 {FINANCIAL_DOC_TYPES} 之一")
+    alloc = _contract_project_allocations(c, _all_contract_shares(db).get(c.id))
+    alloc_pids = [pid for pid, _amt in alloc]
+    if project_id is not None and project_id not in alloc_pids:
+        raise HTTPException(status_code=400, detail="该合同未分摊到所选项目，请先在「合同分摊」中配置")
+    if project_id is None and len(alloc_pids) > 1:
+        raise HTTPException(status_code=400, detail="该合同被多个项目共用，请指定单据归属项目")
     pid = project_id if project_id is not None else c.project_id
     results, errors = [], []
     for f in files:
@@ -3828,15 +5122,31 @@ class FinancialDocUpdate(BaseModel):
     tax_amount: Optional[float] = None
     doc_date: Optional[str] = None
     doc_type: Optional[str] = None
+    project_id: Optional[int] = None
+    contract_id: Optional[int] = None
     remark: Optional[str] = None
 
 
-@app.put("/financial-docs/{doc_id}", summary="编辑财务资料字段（人工校对修正）")
+@app.put("/financial-docs/{doc_id}", summary="编辑财务资料字段（人工校对修正，可改归属项目/合同）")
 def update_financial_doc(doc_id: int, req: FinancialDocUpdate, db: Session = Depends(get_db)):
     d = db.query(FinancialDoc).filter(FinancialDoc.id == doc_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="财务资料不存在")
-    for k, v in req.dict(exclude_unset=True).items():
+    data = req.dict(exclude_unset=True)
+    if "doc_type" in data and data["doc_type"] not in FINANCIAL_DOC_TYPES:
+        raise HTTPException(status_code=400, detail=f"单据类型须为 {FINANCIAL_DOC_TYPES} 之一")
+    cid = data.get("contract_id", d.contract_id)
+    pid = data.get("project_id", d.project_id)
+    if "contract_id" in data or "project_id" in data:
+        c = db.query(Contract).filter(Contract.id == cid).first()
+        if not c:
+            raise HTTPException(status_code=404, detail="关联合同不存在")
+        alloc = _contract_project_allocations(c, _all_contract_shares(db).get(c.id))
+        if pid is not None and pid not in [p for p, _ in alloc]:
+            raise HTTPException(status_code=400, detail="该合同未分摊到所选项目，请先配置合同分摊")
+        if pid is None and len(alloc) > 1:
+            raise HTTPException(status_code=400, detail="共享合同必须指定单据归属项目")
+    for k, v in data.items():
         setattr(d, k, v)
     db.commit()
     return _fin_doc_to_dict(d)
@@ -3914,42 +5224,69 @@ def update_config(req: ConfigUpdateRequest, db: Session = Depends(get_db)):
 
 # ============ 经费比对 / 风险预警 / 预算统计 ============
 def _funding_overview(db: Session, project_id: Optional[int] = None) -> dict:
-    """经费全景：按项目聚合合同含税额 + 暂估/结算/发票实际额，计算超额与差异。
-    final_amount_basis 决定「最终填充金额」口径；发票默认覆盖暂估/结算。"""
+    """经费全景：按项目聚合合同分摊额 + 暂估/结算/发票实际额，计算超额与差异。
+
+    共享合同口径：合同金额先按「合同分摊」拆到各项目，再逐项目比对，避免同一合同被两个项目重复计算。
+    final_amount_basis 决定「最终填充金额」口径；发票默认覆盖暂估/结算。
+    """
     cfg = {
         "final_amount_basis": _get_config(db, "final_amount_basis", "invoice"),
         "overrun_basis": _get_config(db, "overrun_basis", "contract_incl_tax"),
         "overrun_tolerance": float(_get_config(db, "overrun_tolerance", "0.0") or 0),
     }
-    pmap = {p.id: p.name for p in db.query(Project).all()}
-    q = db.query(Contract)
-    if project_id is not None:
-        q = q.filter(Contract.project_id == project_id)
-    contracts = q.order_by(Contract.created_at.asc(), Contract.id.asc()).all()
+    projects = db.query(Project).all()
+    pmap = {p.id: p.name for p in projects}
+    completed_ids = _completed_project_ids(db)
+    contracts = db.query(Contract).order_by(Contract.created_at.asc(), Contract.id.asc()).all()
+    shares_map = _all_contract_shares(db)
     cids = [c.id for c in contracts]
     docs = db.query(FinancialDoc).filter(FinancialDoc.contract_id.in_(cids)).all() if cids else []
-
     doc_map: dict = {}
     for d in docs:
         doc_map.setdefault(d.contract_id, []).append(d)
 
+    def _doc_pid(d, c):
+        return d.project_id if d.project_id is not None else (c.project_id if c is not None else None)
+
+    # 先按 (合同, 项目) 聚合单据，保证共享合同的单据只计入实际承担项目
+    doc_cp: dict = {}
+    for c in contracts:
+        for d in doc_map.get(c.id, []):
+            if not d.confirmed:
+                continue
+            pid = _doc_pid(d, c)
+            rec = doc_cp.setdefault((c.id, pid), {"estimate": 0.0, "settlement": 0.0, "invoice": 0.0})
+            amt = d.amount or 0
+            if d.doc_type == "暂估单":
+                rec["estimate"] += amt
+            elif d.doc_type == "结算单":
+                rec["settlement"] += amt
+            else:
+                rec["invoice"] += amt
+
+    def _eff(est, stl, inv):
+        basis = cfg["final_amount_basis"]
+        if basis == "estimate":
+            return est
+        if basis == "both":
+            return None
+        return inv if inv > 0 else (stl if stl > 0 else est)
+
     contracts_detail = []
     projects_agg: dict = {}
     for c in contracts:
+        alloc = _contract_project_allocations(c, shares_map.get(c.id))
+        alloc_pids = [pid for pid, _amt in alloc]
+        if project_id is not None and project_id not in alloc_pids:
+            continue
+        incl = _contract_total_amount(c)
         dl = doc_map.get(c.id, [])
         est = sum(d.amount or 0 for d in dl if d.doc_type == "暂估单" and d.confirmed)
         stl = sum(d.amount or 0 for d in dl if d.doc_type == "结算单" and d.confirmed)
         inv = sum(d.amount or 0 for d in dl if d.doc_type == "发票" and d.confirmed)
-        incl = c.amount_incl_tax or c.amount_value or 0
-        basis = cfg["final_amount_basis"]
-        if basis == "estimate":
-            eff = est
-        elif basis == "both":
-            eff = None
-        else:  # invoice 默认：发票覆盖暂估/结算
-            eff = inv if inv > 0 else (stl if stl > 0 else est)
+        eff = _eff(est, stl, inv)
         diff = (eff - incl) if eff is not None else None
-        contracts_detail.append({
+        detail = {
             "id": c.id, "contract_name": c.contract_name or "", "original_name": c.original_name or "",
             "contract_no": c.contract_no or "",
             "party_a": c.party_a or "", "party_b": c.party_b or "",
@@ -3961,19 +5298,46 @@ def _funding_overview(db: Session, project_id: Optional[int] = None) -> dict:
             "estimate_total": round(est, 2), "settlement_total": round(stl, 2), "invoice_total": round(inv, 2),
             "effective_total": round(eff, 2) if eff is not None else None,
             "diff_vs_contract": round(diff, 2) if diff is not None else None,
-        })
-        pid = c.project_id if c.project_id is not None else 0
-        a = projects_agg.setdefault(pid, {
-            "project_id": pid, "project_name": pmap.get(pid, "平台级"),
-            "contract_incl_tax": 0.0, "estimate": 0.0, "settlement": 0.0, "invoice": 0.0,
-            "effective": 0.0, "contract_count": 0,
-        })
-        a["contract_incl_tax"] += incl
-        a["estimate"] += est
-        a["settlement"] += stl
-        a["invoice"] += inv
-        a["effective"] += (eff or 0)
-        a["contract_count"] += 1
+            "allocations": [
+                {"project_id": pid, "project_name": pmap.get(pid, "平台级"), "amount": round(amt, 2)}
+                for pid, amt in alloc
+            ],
+            "is_shared": len(alloc) > 1,
+        }
+        if project_id is not None:
+            share = next((amt for pid, amt in alloc if pid == project_id), 0.0)
+            p_est = doc_cp.get((c.id, project_id), {}).get("estimate", 0.0)
+            p_stl = doc_cp.get((c.id, project_id), {}).get("settlement", 0.0)
+            p_inv = doc_cp.get((c.id, project_id), {}).get("invoice", 0.0)
+            p_eff = _eff(p_est, p_stl, p_inv)
+            detail.update({
+                "share_amount": round(share, 2),
+                "project_estimate": round(p_est, 2),
+                "project_settlement": round(p_stl, 2),
+                "project_invoice": round(p_inv, 2),
+                "project_effective": round(p_eff, 2) if p_eff is not None else None,
+                "project_diff": round((p_eff - share), 2) if p_eff is not None else None,
+            })
+        contracts_detail.append(detail)
+
+        for pid, amt in alloc:
+            if project_id is not None and pid != project_id:
+                continue
+            a = projects_agg.setdefault(pid or 0, {
+                "project_id": pid or 0,
+                "project_name": pmap.get(pid, "平台级"),
+                "completed": 1 if pid in completed_ids else 0,
+                "contract_incl_tax": 0.0, "estimate": 0.0, "settlement": 0.0, "invoice": 0.0,
+                "effective": 0.0, "contract_count": 0,
+            })
+            cp = doc_cp.get((c.id, pid), {"estimate": 0.0, "settlement": 0.0, "invoice": 0.0})
+            p_eff = _eff(cp["estimate"], cp["settlement"], cp["invoice"])
+            a["contract_incl_tax"] += amt
+            a["estimate"] += cp["estimate"]
+            a["settlement"] += cp["settlement"]
+            a["invoice"] += cp["invoice"]
+            a["effective"] += (p_eff or 0)
+            a["contract_count"] += 1
 
     budget_map: dict = {}
     for f in db.query(Funding).filter(Funding.fund_type == "预算").all():
@@ -4068,6 +5432,7 @@ def _generate_todo_items(db: Session) -> list:
     """汇总所有提醒为待办条目（不写库，纯计算）。alert_key 为稳定键，供 _sync_todos 幂等同步与 dismissed 过滤。"""
     today = date.today()
     pmap = {p.id: p.name for p in db.query(Project).all()}
+    completed_ids = _completed_project_ids(db)
     contracts = db.query(Contract).all()
     cmap = {c.id: c for c in contracts}
     nodes = db.query(ContractNode).all()
@@ -4184,6 +5549,82 @@ def _generate_todo_items(db: Session) -> list:
                           "link": "funding", "source_id": p["project_id"],
                           "project_id": p["project_id"], "contract_id": None,
                           "alert_key": f"超额|{p['project_id']}", "alert_date": None})
+
+    # 6) 网络通讯台账：等保测评到期 / 整改逾期 / IP-MAC 冲突 / 台账待完善
+    try:
+        net_systems = db.query(NetSystem).all()
+        sys_name = {s.id: s.name for s in net_systems}
+        for s in net_systems:
+            d = _parse_date(s.next_eval_date) if s.next_eval_date else None
+            if not d:
+                continue
+            days = (d - today).days
+            if days <= 90:
+                if days < 0:
+                    title = f"定级系统「{s.name}」等保测评已超期"
+                    detail = f"下次测评日 {s.next_eval_date}，已超 {abs(days)} 天（{s.level or '未定级'}）"
+                    level = "danger"
+                else:
+                    title = f"定级系统「{s.name}」等保测评临近"
+                    detail = f"下次测评日 {s.next_eval_date}，剩 {days} 天（{s.level or '未定级'}）"
+                    level = "warning"
+                items.append({"category": "等保测评到期", "level": level, "title": title,
+                              "detail": detail, "link": "network", "source_id": s.id,
+                              "project_id": None, "contract_id": None,
+                              "alert_key": f"等保到期|{s.id}", "alert_date": s.next_eval_date})
+
+        for f in db.query(NetFinding).filter(NetFinding.status.notin_(["已整改", "已验收"])).all():
+            d = _parse_date(f.plan_date) if f.plan_date else None
+            if not d:
+                continue
+            days = (d - today).days
+            if days < 0:
+                items.append({"category": "整改逾期", "level": "danger",
+                              "title": f"整改逾期：{sys_name.get(f.system_id, '')} 问题{f.problem_no or ''}",
+                              "detail": f"计划 {f.plan_date}，已逾期 {abs(days)} 天；{(f.description or '')[:60]}",
+                              "link": "network", "source_id": f.id, "project_id": None, "contract_id": None,
+                              "alert_key": f"整改逾期|{f.id}", "alert_date": f.plan_date})
+
+        addr_rows = db.query(NetAddress).all()
+        by_ip, by_mac = {}, {}
+        for a in addr_rows:
+            if a.ip:
+                by_ip.setdefault(a.ip, []).append(a)
+            if a.mac:
+                by_mac.setdefault(a.mac, []).append(a)
+        for ip, rows in by_ip.items():
+            if len(rows) > 1:
+                items.append({"category": "IP地址冲突", "level": "danger",
+                              "title": f"IP 地址冲突：{ip}",
+                              "detail": f"{len(rows)} 条记录共用该 IP，请核实使用人/设备",
+                              "link": "network", "source_id": rows[0].id, "project_id": None, "contract_id": None,
+                              "alert_key": f"IP冲突|{ip}", "alert_date": None})
+        for mac, rows in by_mac.items():
+            if len(rows) > 1:
+                items.append({"category": "MAC地址冲突", "level": "warning",
+                              "title": f"MAC 地址冲突：{mac}",
+                              "detail": f"{len(rows)} 条记录共用该 MAC，可能是换机/重复登记",
+                              "link": "network", "source_id": rows[0].id, "project_id": None, "contract_id": None,
+                              "alert_key": f"MAC冲突|{mac}", "alert_date": None})
+
+        incomplete = {}
+        for dev in db.query(NetDevice).all():
+            if not dev.system_id or not dev.zone:
+                incomplete[dev.site_id] = incomplete.get(dev.site_id, 0) + 1
+        site_name = {s.id: s.name for s in db.query(NetSite).all()}
+        for sid, cnt in incomplete.items():
+            if cnt:
+                items.append({"category": "台账待完善", "level": "info",
+                              "title": f"站点「{site_name.get(sid, '')}」有 {cnt} 台设备缺定级系统/网络区域",
+                              "detail": "请在「网络通讯台账 → 设备台账」补全，或批量修改",
+                              "link": "network", "source_id": sid, "project_id": None, "contract_id": None,
+                              "alert_key": f"台账待完善|{sid}", "alert_date": None})
+    except Exception as e:
+        logger.warning("[待办] 网络台账提醒生成失败：%s", e)
+
+    # 统一过滤：已完结项目不再产生任何风险提醒（合同/付款/延期/质保/超额等），网络台账提醒不受影响
+    if completed_ids:
+        items = [it for it in items if it.get("project_id") not in completed_ids]
 
     # 统一过滤：已关闭（不再提醒）的预警不返回 → 预警/待办/角标三处一致
     dismissed_keys = {d.alert_key for d in db.query(AlertDismissed).all()}
@@ -4421,7 +5862,10 @@ def _extract_achievement_fields(content: str, filename: str = "") -> dict:
         "1. 只输出 JSON，禁止 markdown 代码块和任何解释\n"
         "2. 日期统一 YYYY-MM-DD，没有就填空串\n"
         "3. category/status 必须从给定候选里选最贴切的一个\n"
-        "4. 无法判断的字段填空串\n\n"
+        "4. 无法判断的字段填空串\n"
+        "5. status 判定（专利重点）：材料中出现「发明专利证书」「授权通知书」「办理登记通知书」"
+        "「办登通知」「授 权 通 知 书」或已给出「授权公告日」的，说明专利已授权，status 必须选「已授权」；"
+        "只有当材料明确是「专利申请受理通知书」且尚未授权时，才选「已登记」\n\n"
         f"文件名：{filename}\n"
         f"材料文本：\n{text_part}"
     )
@@ -4432,7 +5876,7 @@ def _extract_achievement_fields(content: str, filename: str = "") -> dict:
         "max_tokens": 1200,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+    resp = post_deepseek(payload, module="achievement_extract", scan_text=text_part, filename=filename, timeout=120)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -4455,6 +5899,30 @@ def _extract_achievement_fields(content: str, filename: str = "") -> dict:
     }
 
 
+def _normalize_achievement_fields(fields: dict) -> dict:
+    """识别结果口径校正（兜底）：专利类只要识别到取得日期（授权公告日），状态一律收敛为「已授权」。
+
+    历史脏数据来源：AI 常把「办理登记通知书 / 电子证书」这类已授权材料判成「已登记」，
+    导致按「已授权」筛选时漏掉已下证的专利。这里做统一收敛，避免依赖 LLM 单次判断。
+    """
+    if not fields:
+        return fields
+    if (fields.get("category") or "").strip() == "专利" and (fields.get("achieve_date") or "").strip():
+        if (fields.get("status") or "").strip() != "已授权":
+            fields["status"] = "已授权"
+    return fields
+
+
+def _reconcile_achievement_status(a) -> bool:
+    """对数据库里的成果做状态口径校正，返回是否发生变更。规则同上（专利有授权日 ⇒ 已授权）。"""
+    if a.category == "专利" and (a.achieve_date or "").strip() and a.status != "已授权":
+        old = a.status
+        a.status = "已授权"
+        logger.info(f"[成果口径] #{a.id} 状态校正：{old} → 已授权（存在授权公告日 {a.achieve_date}）")
+        return True
+    return False
+
+
 def _process_achievement_async(achievement_id: int, file_path: str, original_name: str):
     """后台线程：提取成果文件文本（含扫描件 OCR）→ LLM 识别字段 → 回填数据库，最后置 done/error。"""
     db = SessionLocal()
@@ -4468,7 +5936,16 @@ def _process_achievement_async(achievement_id: int, file_path: str, original_nam
         fields = {}
         if content and content.strip():
             try:
-                fields = _extract_achievement_fields(content, original_name)
+                fields = _normalize_achievement_fields(_extract_achievement_fields(content, original_name))
+            except AIBlocked as e:
+                a0 = db.query(Achievement).filter(Achievement.id == achievement_id).first()
+                if a0 is not None:
+                    a0.processing_status = "done"
+                    a0.name = a0.name or os.path.splitext(original_name)[0]
+                    a0.remark = f"AI合规拦截：{e}"
+                    db.commit()
+                logger.warning(f"[成果后台] AI 合规拦截 {original_name}：{e}")
+                return
             except Exception as e:
                 logger.error(f"[成果后台] 识别字段失败 {original_name}：{e}")
 
@@ -4536,6 +6013,9 @@ def _reidentify_achievement_async(achievement_id: int, file_path: str, original_
             val = (fields.get(key) or "").strip()
             if val and not getattr(a, attr, None):
                 setattr(a, attr, val)
+
+        # 口径校正（回填之后再判，覆盖错误的「已登记」）：专利有授权公告日 ⇒ 已授权
+        _reconcile_achievement_status(a)
 
         a.processing_status = "done"
         db.commit()
@@ -5107,6 +6587,9 @@ def dashboard(db: Session = Depends(get_db)):
 
     # 计数：数据库 COUNT 聚合，避免加载全表
     project_count = db.query(func.count(Project.id)).scalar() or 0
+    completed_project_count = db.query(func.count(Project.id)).filter(Project.completed == 1).scalar() or 0
+    active_project_count = project_count - completed_project_count
+    completed_ids = _completed_project_ids(db)
     file_count = db.query(func.count(ProjectFile.id)).scalar() or 0
     contract_count = db.query(func.count(Contract.id)).scalar() or 0
     achievement_count = db.query(func.count(Achievement.id)).scalar() or 0
@@ -5135,10 +6618,10 @@ def dashboard(db: Session = Depends(get_db)):
     contract_total_amount = round(db.query(func.sum(Contract.amount_value)).scalar() or 0, 2)
     contract_by_status = {}
     overdue_count = 0
-    for (due_date,) in db.query(Contract.due_date).all():
+    for (due_date, cpid) in db.query(Contract.due_date, Contract.project_id).all():
         status, _ = _contract_status(due_date)
         contract_by_status[status] = contract_by_status.get(status, 0) + 1
-        if status == "已超期":
+        if status == "已超期" and cpid not in completed_ids:
             overdue_count += 1
 
     # 成果分类分布：只统计「最终成果」（已授权/已发表/已登记/已获奖/已发布），
@@ -5160,6 +6643,8 @@ def dashboard(db: Session = Depends(get_db)):
 
     return {
         "project_count": project_count,
+        "active_project_count": active_project_count,
+        "completed_project_count": completed_project_count,
         "file_count": file_count,
         "contract_count": contract_count,
         "achievement_count": achievement_count,

@@ -35,7 +35,12 @@ def _load_content(db_file) -> str:
         return db_file.content
     # 3) 都没有 → 现场提取并写磁盘
     if os.path.exists(db_file.file_path):
-        content = extract_text_from_file(db_file.file_path)
+        try:
+            content = extract_text_from_file(db_file.file_path)
+        except Exception as e:
+            # 单个文件损坏不应让整批检索（全文搜索/问答）抛 500，按空内容跳过
+            print(f"[读取] 现场提取失败（已按空内容跳过）：{e}")
+            content = ""
         _save_content(db_file.stored_name, content)
         return content
     return ""

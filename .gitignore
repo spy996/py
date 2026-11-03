@@ -6,6 +6,9 @@ __pycache__/
 *.py[cod]
 venv/
 
+# 本地备份文件
+*.bak*
+
 # 数据库
 *.db
 

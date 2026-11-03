@@ -6,6 +6,7 @@ from typing import List
 import requests
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_API_URL
+from utils.ai_gateway import post_deepseek
 
 # 文本分块参数
 CHUNK_SIZE = 1200        # 每个文本块的字符数（更细的块，便于精确命中 + 覆盖更多文件）
@@ -44,7 +45,7 @@ def _expand_query(question: str) -> List[str]:
         "max_tokens": 300,
         "stream": False,
     }
-    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=30)
+    resp = post_deepseek(payload, module="query_expand", scan_text=question, timeout=30)
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
@@ -88,7 +89,7 @@ def _chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP)
 MAX_CONTINUATIONS = 3  # 回答因 max_tokens 被截断时，最多额外续写次数
 
 
-def _call_deepseek(question: str, context: str) -> str:
+def _call_deepseek(question: str, context: str, confirm_l3: bool = False) -> str:
     """调用 DeepSeek API，仅依据资料回答问题；回答被截断时自动续写补全。"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -124,7 +125,8 @@ def _call_deepseek(question: str, context: str) -> str:
             "max_tokens": 8100,
             "stream": False,
         }
-        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=120)
+        resp = post_deepseek(payload, module="ask", scan_text=f"{context}\n{question}",
+                             confirm_l3=confirm_l3, timeout=120)
         resp.raise_for_status()
         choice = resp.json()["choices"][0]
         content = (choice.get("message", {}).get("content") or "").strip()

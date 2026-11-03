@@ -194,8 +194,13 @@ def _extract_text_from_docx(file_path: str) -> str:
         from docx import Document
     except ImportError:
         return "（未安装 python-docx，请运行：pip install python-docx）"
-    doc = Document(file_path)
-    return "\n".join(p.text for p in doc.paragraphs)
+    try:
+        doc = Document(file_path)
+        return "\n".join(p.text for p in doc.paragraphs)
+    except Exception as e:
+        # 损坏/加密/结构异常的 docx（如 PackageNotFoundError、BadZipFile）不应打断整批检索
+        print(f"[OCR调试] 解析 docx 失败（文件损坏或格式异常）：{e}")
+        return ""
 
 
 def _extract_text_from_pptx(file_bytes: bytes) -> str:

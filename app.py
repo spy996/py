@@ -15,6 +15,8 @@ import re
 from constants import PROJECT_STAGES
 from ui_common import fmt_money, time_filter_widget, stage_progress
 from config import DATA_DIR
+from net_ui import render_net_page
+from funding_ui import render_funding_page
 
 
 # ★★★ 让 requests 绕过系统代理，直接访问本机后端 ★★★
@@ -371,6 +373,146 @@ def api_delete_funding_attachment(att_id):
         return None
 
 
+# ============ 成果台账：按类型核定的筛选维度 ============
+# 不同成果类型的「日期」业务含义不同，筛选条件必须按类型分别核定，不能用一套「取得日期」涵盖全部。
+#   apply_label   ：受理 / 申请日期的显示名（None = 该类型没有这一维度）
+#   achieve_label ：取得日期在该类型下的真实业务名（授权日 / 发表日期 / 登记日期 …）
+#   statuses      ：该类型合理的状态候选（仅用于下拉排序与提示，实际选项以库中真实值为准）
+ACH_CATEGORY_PROFILE = {
+    "专利":       {"apply_label": "受理 / 申请日", "achieve_label": "授权日",   "statuses": ["已授权", "已受理", "已登记", "在研", "其他"]},
+    "论文":       {"apply_label": None,            "achieve_label": "发表日期", "statuses": ["已发表", "已录用", "已登记", "其他"]},
+    "软件著作权": {"apply_label": None,            "achieve_label": "登记日期", "statuses": ["已登记", "其他"]},
+    "鉴定报告":   {"apply_label": None,            "achieve_label": "鉴定日期", "statuses": ["已登记", "已完成", "其他"]},
+    "获奖":       {"apply_label": None,            "achieve_label": "获奖日期", "statuses": ["已获奖", "其他"]},
+    "标准":       {"apply_label": None,            "achieve_label": "发布日期", "statuses": ["已发布", "其他"]},
+    "成果登记":   {"apply_label": None,            "achieve_label": "登记日期", "statuses": ["已登记", "其他"]},
+    "其他":       {"apply_label": None,            "achieve_label": "取得日期", "statuses": ["其他"]},
+}
+ACH_CATEGORIES = list(ACH_CATEGORY_PROFILE.keys())
+_ACH_DEFAULT_PROFILE = {"apply_label": None, "achieve_label": "取得日期", "statuses": []}
+
+# 快速筛选：用「实质状态」判定，规避自动识别把「已授权的专利」标成「已登记」的脏数据
+ACH_QUICK_OPTIONS = ["不限", "✅ 已授权（含已下证）", "⏳ 受理中（未下证）", "⚠️ 日期待补录"]
+
+_DATE_RE = re.compile(r"(\d{4})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})")
+
+
+def _norm_date(s):
+    """把各种日期写法（2026/1/5、2026年1月5日、2026.01.05、2026-01-05）统一规范为 YYYY-MM-DD。
+    无法解析时返回 ''，避免裸字符串比较导致的筛选错判。"""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    m = _DATE_RE.search(s)
+    if m:
+        y, mo, d = m.group(1), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y}-{mo:02d}-{d:02d}"
+        return ""
+    m2 = re.fullmatch(r"(\d{4})", s)
+    return f"{m2.group(1)}-01-01" if m2 else ""
+
+
+def _ach_date_in_range(value, d_from, d_to, include_empty=False):
+    """单日期区间判定：日期按 _norm_date 规范化后比较，空值行为由 include_empty 明确控制。"""
+    if not d_from and not d_to:
+        return True
+    v = _norm_date(value)
+    if not v:
+        return bool(include_empty)
+    if d_from and v < d_from:
+        return False
+    if d_to and v > d_to:
+        return False
+    return True
+
+
+def _ach_quick_match(a, quick):
+    """实质状态判定（与库里 status 字段互补，解决自动识别状态标注不准的问题）。"""
+    if not quick or quick == "不限":
+        return True
+    cat = a.get("category") or ""
+    ach = (a.get("achieve_date") or "").strip()
+    app = (a.get("application_date") or "").strip()
+    stt = a.get("status") or ""
+    if quick.startswith("✅"):
+        # 已授权：状态为已授权，或（专利）已拿到授权公告日
+        return stt == "已授权" or (cat == "专利" and ach != "")
+    if quick.startswith("⏳"):
+        # 受理中：专利类且尚无授权日（含被误标为「已登记」的授权未下证件）
+        return cat == "专利" and ach == ""
+    if quick.startswith("⚠️"):
+        # 日期待补录：受理日与取得日均为空
+        return ach == "" and app == ""
+    return True
+
+
+def filter_achievements(items, kw="", cats=None, statuses=None, project_id_sentinel=None,
+                        apply_from="", apply_to="", ach_from="", ach_to="",
+                        include_empty_date=False, date_logic="all", quick="不限"):
+    """成果台账筛选（纯函数，便于单独验证）。
+
+    - 关键词：空格分隔多词，全部命中才保留（AND），覆盖 名称/权利人/备注/关联文件/所属项目
+    - 类型、状态：多选，空表示不限
+    - project_id_sentinel：None 表示不限；"__NULL__" 表示「未关联项目」；其余为具体 int
+    - 日期：受理区间与取得区间两组；date_logic="any" 时满足其一即可，否则需同时满足
+    - include_empty_date：使用日期区间时是否纳入日期为空的记录
+    """
+    kw = (kw or "").strip().lower()
+    kw_terms = [t for t in re.split(r"[\s,，]+", kw) if t]
+    cats = cats or []
+    statuses = statuses or []
+    af, at = _norm_date(apply_from), _norm_date(apply_to)
+    bf, bt = _norm_date(ach_from), _norm_date(ach_to)
+
+    out = []
+    for a in items:
+        if kw_terms:
+            hay = " ".join([
+                a.get("name") or "", a.get("holder") or "", a.get("remark") or "",
+                a.get("file_name") or "", a.get("project_name") or "",
+            ]).lower()
+            if not all(t in hay for t in kw_terms):
+                continue
+        if cats and (a.get("category") or "") not in cats:
+            continue
+        if statuses and (a.get("status") or "") not in statuses:
+            continue
+        if project_id_sentinel is not None:
+            pid = a.get("project_id")
+            if project_id_sentinel == "__NULL__":
+                if pid is not None:
+                    continue
+            else:
+                if pid != project_id_sentinel:
+                    continue
+        ok_apply = _ach_date_in_range(a.get("application_date"), af, at, include_empty_date)
+        ok_ach = _ach_date_in_range(a.get("achieve_date"), bf, bt, include_empty_date)
+        if ok_apply and ok_ach:
+            pass
+        elif date_logic == "any" and (ok_apply or ok_ach):
+            pass
+        else:
+            continue
+        if not _ach_quick_match(a, quick):
+            continue
+        out.append(a)
+    return out
+
+
+def _ach_date_labels(selected_cats):
+    """根据当前选中的类型，返回 (受理日标签 or None, 取得日标签)。"""
+    if not selected_cats:
+        return "受理 / 申请日", "取得日期（授权 / 发表 / 登记）"
+    profiles = [ACH_CATEGORY_PROFILE.get(c, _ACH_DEFAULT_PROFILE) for c in selected_cats]
+    apply_labels = [p["apply_label"] for p in profiles if p.get("apply_label")]
+    if len(selected_cats) == 1:
+        achieve_label = profiles[0]["achieve_label"]
+    else:
+        achieve_label = "取得日期（授权 / 发表 / 登记）"
+    return (" / ".join(apply_labels) if apply_labels else None), achieve_label
+
+
 # ============ 成果台账 API ============
 def api_list_achievements(project_id=None):
     try:
@@ -397,6 +539,8 @@ def api_create_achievement_manual(payload, file=None):
             "category": payload.get("category", "其他"),
             "status": payload.get("status", "其他"),
             "holder": payload.get("holder") or "",
+            # 受理 / 申请日期：专利类成果按受理时间筛选的关键字段，此前漏传导致该列始终为空
+            "application_date": payload.get("application_date") or "",
             "achieve_date": payload.get("achieve_date") or "",
             "remark": payload.get("remark") or "",
         }
@@ -528,6 +672,122 @@ def api_delete_project(project_id):
     return requests.delete(f"{API_BASE}/projects/{project_id}")
 
 
+def api_complete_project(project_id, note=""):
+    """项目完结：完结后不再生成该项目的风险提醒（历史数据保留）。"""
+    try:
+        return requests.post(f"{API_BASE}/projects/{project_id}/complete", json={"note": note}, timeout=30)
+    except Exception as e:
+        st.error(f"项目完结失败：{e}")
+        return None
+
+
+def api_reopen_project(project_id):
+    try:
+        return requests.post(f"{API_BASE}/projects/{project_id}/reopen", timeout=30)
+    except Exception as e:
+        st.error(f"重新开启失败：{e}")
+        return None
+
+
+@st.dialog("🏁 项目完结")
+def _complete_project_dialog(project_id, project_name):
+    """项目完结确认弹窗：点击行内「完结」后立即弹出，避免确认框藏在长列表底部。"""
+    st.markdown(f"**{project_name}**")
+    st.warning("完结后：该项目的合同超期/临期、逾期付款、延期、质保金、超额等风险提醒将自动隐藏；"
+               "项目、合同、经费、成果等历史数据全部保留，可随时在筛选/台账中查看。")
+    note = st.text_area("完结说明 / 验收结论（可选）", key=f"dlg_complete_note_{project_id}",
+                        placeholder="如：2026 年 10 月通过验收，经费决算已完成")
+    c1, c2 = st.columns(2)
+    if c1.button("✅ 确认完结", type="primary", key=f"dlg_complete_yes_{project_id}", use_container_width=True):
+        resp = api_complete_project(project_id, note)
+        if resp is not None and resp.status_code == 200:
+            st.session_state.pop("complete_project_id", None)
+            st.success("项目已完结")
+            st.rerun()
+        elif resp is not None:
+            st.error(f"完结失败：{resp.text}")
+    if c2.button("❌ 取消", key=f"dlg_complete_no_{project_id}", use_container_width=True):
+        st.session_state.pop("complete_project_id", None)
+        st.rerun()
+
+
+@st.dialog("↩️ 重新开启项目")
+def _reopen_project_dialog(project_id, project_name):
+    st.markdown(f"**{project_name}**")
+    st.warning("重新开启后，该项目会重新参与风险提醒计算。")
+    c1, c2 = st.columns(2)
+    if c1.button("✅ 确认开启", type="primary", key=f"dlg_reopen_yes_{project_id}", use_container_width=True):
+        resp = api_reopen_project(project_id)
+        if resp is not None and resp.status_code == 200:
+            st.session_state.pop("reopen_project_id", None)
+            st.success("项目已重新开启")
+            st.rerun()
+        elif resp is not None:
+            st.error(f"开启失败：{resp.text}")
+    if c2.button("❌ 取消", key=f"dlg_reopen_no_{project_id}", use_container_width=True):
+        st.session_state.pop("reopen_project_id", None)
+        st.rerun()
+
+
+def _project_edit_block(p):
+    """在选中的项目行下方就地渲染编辑表单（不再放到页面最底部）。"""
+    eid = p["id"]
+    with st.container(border=True):
+        st.markdown(f"**✏️ 编辑项目：{p.get('name', '')}**")
+        with st.form(f"edit_project_form_{eid}"):
+            ncode = st.text_input("项目编号（必填，唯一）", value=p.get("code") or "",
+                                  key=f"edit_proj_code_{eid}")
+            nname = st.text_input("项目名称（必填）", value=p.get("name") or "",
+                                  key=f"edit_proj_name_{eid}")
+            ndesc = st.text_area("项目描述（可选，留空即清空）", value=p.get("description") or "",
+                                 key=f"edit_proj_desc_{eid}")
+            _cur_stage = p.get("stage") or "项目立项"
+            _stage_idx = PROJECT_STAGES.index(_cur_stage) if _cur_stage in PROJECT_STAGES else 0
+            nstage = st.selectbox("项目阶段", PROJECT_STAGES, index=_stage_idx,
+                                  key=f"edit_proj_stage_{eid}")
+            _cur_year = p.get("start_year")
+            try:
+                _cur_year_int = int(_cur_year) if _cur_year not in (None, "") else None
+            except (TypeError, ValueError):
+                _cur_year_int = None
+            clear_year = st.checkbox("清空立项年份（设为「未标注年份」）", value=False,
+                                     key=f"edit_proj_clear_year_{eid}")
+            nyear = st.number_input(
+                "立项年份", min_value=1990, max_value=2100,
+                value=_cur_year_int, step=1, disabled=clear_year,
+                key=f"edit_proj_year_{eid}",
+            )
+            submitted = st.form_submit_button("💾 保存修改")
+
+        if submitted:
+            if not (ncode or "").strip() or not (nname or "").strip():
+                st.error("项目编号和项目名称是必填的！")
+            else:
+                payload = {
+                    "code": (ncode or "").strip(),
+                    "name": (nname or "").strip(),
+                    "description": ndesc,
+                    "stage": nstage,
+                    "start_year": None if clear_year else (int(nyear) if nyear else None),
+                }
+                resp = api_update_project(eid, payload)
+                if resp is None:
+                    st.error("无法连接后端")
+                elif resp.status_code == 200:
+                    st.success("项目已更新")
+                    st.session_state["edit_project_id"] = None
+                    st.rerun()
+                else:
+                    try:
+                        st.error(resp.json().get("detail", "更新失败"))
+                    except Exception:
+                        st.error(f"更新失败：{resp.text}")
+
+        if st.button("❌ 取消编辑", key=f"cancel_edit_{eid}"):
+            st.session_state["edit_project_id"] = None
+            st.rerun()
+
+
 def api_list_files(project_id):
     resp = requests.get(f"{API_BASE}/projects/{project_id}/files")
     if resp.status_code == 200:
@@ -537,7 +797,7 @@ def api_list_files(project_id):
 
 def api_upload_file(project_id, file):
     files = {"file": (file.name, file.getvalue())}
-    return requests.post(f"{API_BASE}/projects/{project_id}/files", files=files)
+    return requests.post(f"{API_BASE}/projects/{project_id}/files", files=files, timeout=600)
 
 
 def api_download_file(file_id):
@@ -624,6 +884,8 @@ def _contract_display_label(c, with_project=True):
         pname = (c.get("project_name") or "").strip()
         if pname:
             label = f"{pname} ｜ {label}"
+    if c.get("is_shared"):
+        label += "｜共享合同"
     return label
 
 
@@ -1100,18 +1362,43 @@ def _fmt_stat_num(v):
     return f"{v:,.2f}"
 
 
-def api_ask(question, top_k=5, project_id=None):
+def api_ask(question, top_k=5, project_id=None, confirm_ai=False):
     """调用后端 /ask 智能问答接口（深度回答可能较慢 + 回答截断自动续写，超时放宽到 600s）"""
     try:
         resp = requests.post(
             f"{API_BASE}/ask",
-            json={"question": question, "top_k": top_k, "project_id": project_id},
+            json={"question": question, "top_k": top_k, "project_id": project_id,
+                  "confirm_ai": bool(confirm_ai)},
             timeout=600,
         )
         return resp
     except Exception as e:
         st.error(f"智能问答请求失败：{e}")
         return None
+
+
+def api_ai_policy():
+    try:
+        resp = requests.get(f"{API_BASE}/ai/policy", timeout=10)
+        return resp.json() if resp.status_code == 200 else {}
+    except Exception:
+        return {}
+
+
+def api_update_ai_policy(payload):
+    try:
+        return requests.put(f"{API_BASE}/ai/policy", json=payload, timeout=15)
+    except Exception as e:
+        st.error(f"保存 AI 策略失败：{e}")
+        return None
+
+
+def api_ai_audit(limit=20):
+    try:
+        resp = requests.get(f"{API_BASE}/ai/audit", params={"limit": limit}, timeout=15)
+        return resp.json() if resp.status_code == 200 else []
+    except Exception:
+        return []
 
 
 def api_cross_project(question):
@@ -1144,10 +1431,17 @@ def render_ask_page():
         "选择要提问的项目",
         option_names,
         help="选择后，问答只会在该项目的文件里查找资料",
+        key="auto_w_1285",
     )
     selected_project_id = None if selected == "🌐 全部项目" else project_options[selected]
 
     question = st.text_input("请输入你的问题：", key="ask_input")
+    confirm_ai = st.checkbox(
+        "允许对敏感内容脱敏后使用 AI（L3）",
+        value=False,
+        key="ask_confirm_ai",
+        help="L4（等保报告/拓扑/漏洞等）始终禁止外发；L3（合同/财务/IP-MAC/人员等）勾选后脱敏外发。",
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1166,7 +1460,7 @@ def render_ask_page():
             st.warning("请先输入问题")
         else:
             with st.spinner("正在检索资料并生成答案，请稍候……"):
-                resp = api_ask(q, top_k=1100, project_id=selected_project_id)
+                resp = api_ask(q, top_k=1100, project_id=selected_project_id, confirm_ai=confirm_ai)
 
             if resp is None:
                 pass  # 错误已在 api_ask 中提示
@@ -1174,6 +1468,9 @@ def render_ask_page():
                 st.error(f"问答失败：{resp.text}")
             else:
                 data = resp.json()
+                if data.get("blocked") or data.get("mode") == "local":
+                    _why = data.get("reason", "")
+                    st.info("已使用本地模式回答（未外发 AI）" + (f"：{_why}" if _why else ""))
                 answer = data.get("answer", "")
                 references = data.get("references", [])
                 statistics = data.get("statistics", [])
@@ -1739,13 +2036,40 @@ if not st.session_state.get("token"):
 _apply_auth()
 _maybe_refresh_token()
 
+# ============ 跨模块状态保留（快照-回填桥） ============
+# Streamlit 机制：切换侧边栏模块会让旧模块的输入控件从渲染树消失，
+# 下一次运行结束时其 session_state 会被自动清理 → 切回模块时填过的内容全部丢失。
+# 桥接方案：每次运行【末尾】把纯输入控件的值快照到普通 key（永不被清理，见文件末尾）；
+# 每次运行【开头】把快照回填为 widget 初始值 → 切回模块时输入内容原样恢复。
+# 白名单 = 所有带 key 且不带动态默认值(value/default/index)的输入控件（AST 扫描生成）；
+# 编辑类表单（值来自数据库，默认值应每次重算）与导航/登录态不在其列。
+_KEEP_STATE_KEYS = frozenset({
+    "ach_batch_del_confirm", "ach_cat", "ach_dup_confirm", "ach_edit_sel", "ach_filter_ach_from",
+    "ach_filter_ach_to", "ach_filter_apply_from", "ach_filter_apply_to", "ach_filter_cats", "ach_filter_date_logic",
+    "ach_filter_kw", "ach_filter_proj", "ach_filter_quick", "ach_filter_statuses", "ach_proj",
+    "ach_reid_confirm", "ach_sort_opt", "ach_status", "ach_up_proj", "ask_input",
+    "auto_w_1285", "auto_w_2082", "auto_w_2083", "auto_w_2084",
+    "auto_w_3062", "auto_w_3065", "auto_w_3066", "auto_w_3067", "auto_w_3176",
+    "auto_w_3177", "auto_w_3181", "auto_w_3182", "auto_w_3183", "auto_w_3611",
+    "confirm_del_overdue", "contract_date_dim", "contract_dup_confirm", "contract_proj_filter", "contract_select",
+    "contract_upload_project", "cross_input", "file_project_select", "file_search_kw", "fin_proj_dt",
+    "fin_proj_upload", "fin_upload_mode", "ft_search_q", "fund_cmp_proj", "fund_del_sel",
+    "fund_proj", "fund_type", "new_pwd", "new_pwd2", "old_pwd",
+    "pm_project_select",
+})
+_keep_snap = st.session_state.get("_keep_snap")
+if isinstance(_keep_snap, dict):
+    for _k in _KEEP_STATE_KEYS:
+        if _k in _keep_snap and _k not in st.session_state:
+            st.session_state[_k] = _keep_snap[_k]
+
 # 平台主标题已移至侧边栏顶部品牌区（避免与各页面标题重复，主内容区更聚焦）
 
 # 待办未处理数量（用于导航栏角标，每次重跑刷新）
 _todo_unhandled = api_todo_count()
 _todo_label = "✅ 待办模块" + (f"（{_todo_unhandled}）" if _todo_unhandled else "")
 
-NAV_OPTIONS = ["🏠 项目列表", "➕ 创建项目", "📁 文件管理", "📌 项目管理", "📑 合同管理", "💰 经费管理", "🏆 成果台账", _todo_label, "📊 数据大屏", "🔍 全文搜索", "🤖 智能问答", "🌐 跨项目分析", "🔐 审计日志", "💾 系统备份"]
+NAV_OPTIONS = ["🏠 项目列表", "➕ 创建项目", "📁 文件管理", "📌 项目管理", "📑 合同管理", "💰 经费管理", "🏆 成果台账", "🛰️ 网络通讯台账", _todo_label, "📊 数据大屏", "🔍 全文搜索", "🤖 智能问答", "🌐 跨项目分析", "🔐 审计日志", "💾 系统备份"]
 
 # ---- 处理"点击项目跳转"的待办导航：必须在 radio 实例化之前修改 nav_menu ----
 if st.session_state.get("_nav_target"):
@@ -1800,12 +2124,55 @@ with st.sidebar.expander("🔑 修改密码"):
                 except Exception:
                     st.sidebar.error("修改失败")
 
+with st.sidebar.expander("🛡️ AI 合规"):
+    _pol = api_ai_policy() or {}
+    st.caption("策略 B：L1/L2 自动；L3 脱敏+确认；L4 禁止")
+    _ai_enabled = st.checkbox("启用 AI 外发", value=str(_pol.get("ai_enabled", "1")) == "1", key="ai_enabled_chk")
+    _ai_l3 = st.checkbox("L3 自动脱敏后外发", value=str(_pol.get("ai_l3_auto", "1")) == "1",
+                         help="关闭后，L3 内容默认不外发，需逐次勾选确认。", key="ai_l3_chk")
+    _ai_redact = st.checkbox("外发前脱敏 IP/MAC/电话等", value=str(_pol.get("ai_redact", "1")) == "1",
+                             key="ai_redact_chk")
+    try:
+        _ai_max_default = int(float(_pol.get("ai_max_chars", 50000) or 50000))
+    except Exception:
+        _ai_max_default = 50000
+    _ai_max = st.number_input("单次外发字符上限", min_value=1000, max_value=200000,
+                              value=_ai_max_default, step=1000, key="ai_max_chk")
+    if st.button("保存 AI 策略", key="ai_save_btn", use_container_width=True):
+        _r = api_update_ai_policy({
+            "ai_enabled": "1" if _ai_enabled else "0",
+            "ai_l3_auto": "1" if _ai_l3 else "0",
+            "ai_redact": "1" if _ai_redact else "0",
+            "ai_max_chars": int(_ai_max),
+        })
+        if _r is not None and _r.status_code == 200:
+            st.success("已保存")
+        elif _r is not None:
+            st.error(_r.text[:200])
+    _aud = api_ai_audit(8) or []
+    if _aud:
+        st.caption("最近 AI 调用（不记正文）")
+        for _a in _aud[:5]:
+            st.caption(f"· {_a.get('ts','')[5:16]} {_a.get('module','')} {_a.get('sensitivity','')} "
+                       f"{_a.get('action','')} {_a.get('chars','')}字")
+
 
 
 # ============ 页面1：项目列表 ============
 if menu == "🏠 项目列表":
     st.header("项目列表")
     projects = api_list_projects()
+
+    # 完结/开启确认用弹窗：点击行内按钮后立即可见，不会受列表滚动/折叠影响
+    if st.session_state.get("complete_project_id"):
+        cid = st.session_state["complete_project_id"]
+        target = next((p for p in projects if p["id"] == cid), None)
+        _complete_project_dialog(cid, target["name"] if target else f"项目 #{cid}")
+
+    if st.session_state.get("reopen_project_id"):
+        rid = st.session_state["reopen_project_id"]
+        target = next((p for p in projects if p["id"] == rid), None)
+        _reopen_project_dialog(rid, target["name"] if target else f"项目 #{rid}")
 
     # ===== 项目概览框（名字 + 编号 + 描述，按年份折叠）=====
     st.subheader("📌 项目概览")
@@ -1830,6 +2197,7 @@ if menu == "🏠 项目列表":
             _years.append("未标注年份")
 
         with st.container(border=True):
+            _edit_id = st.session_state.get("edit_project_id")
             for _yi, _year in enumerate(_years):
                 _items = _groups[_year]
                 _title = (
@@ -1837,77 +2205,35 @@ if menu == "🏠 项目列表":
                     if _year != "未标注年份"
                     else f"未标注年份（{len(_items)} 个项目）"
                 )
-                # 最新年份默认展开，其余折叠
-                with st.expander(_title, expanded=(_yi == 0)):
+                # 最新年份默认展开；正在编辑的项目所在年份强制展开，保证编辑栏可见
+                with st.expander(_title, expanded=(_yi == 0 or any(p["id"] == _edit_id for p in _items))):
                     for _i, p in enumerate(_items, 1):
                         pcode = p.get("code", "")
                         pdesc = p.get("description", "") or "（无描述）"
-                        c1, c2, c3, c4 = st.columns([5.2, 1.1, 1.1, 1.2])
-                        c1.write(f"{_i}. 📁 {p['name']} ｜ 编号：{pcode} ｜ 描述：{pdesc}")
+                        _done = int(p.get("completed") or 0)
+                        _status = "✅ 已完结" if _done else "🟢 进行中"
+                        c1, c2, c3, c4, c5 = st.columns([4.8, 1, 1, 1, 1.2])
+                        c1.write(f"{_i}. 📁 {p['name']} ｜ 编号：{pcode} ｜ {_status} ｜ 描述：{pdesc}")
                         if c2.button("📂 进入", key=f"enter_{p['id']}", help=f"进入项目「{p['name']}」"):
                             st.session_state["_nav_target"] = ("📁 文件管理", p["id"])
                             st.rerun()
                         if c3.button("✏️ 编辑", key=f"editbtn_{p['id']}", help=f"编辑项目「{p['name']}」"):
                             st.session_state["edit_project_id"] = p["id"]
                             st.rerun()
-                        if c4.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
+                        if _done:
+                            if c4.button("↩️ 开启", key=f"reopenbtn_{p['id']}", help="重新开启已完结项目，恢复风险提醒"):
+                                st.session_state["reopen_project_id"] = p["id"]
+                                st.rerun()
+                        else:
+                            if c4.button("✅ 完结", key=f"completebtn_{p['id']}", help="标记项目已完结，之后不再显示风险提醒"):
+                                st.session_state["complete_project_id"] = p["id"]
+                                st.rerun()
+                        if c5.button("🗑️ 删除", key=f"delbtn_{p['id']}", help="删除该项目"):
                             st.session_state["confirm_del_project"] = p["id"]
 
-    # 编辑项目表单：点击上面某个项目的「✏️ 编辑」后，这里会出现编辑表单
-    if st.session_state.get("edit_project_id") is not None:
-        eid = st.session_state["edit_project_id"]
-        target = next((p for p in projects if p["id"] == eid), None)
-        if target is None:
-            st.session_state["edit_project_id"] = None
-        else:
-            st.divider()
-            st.subheader(f"✏️ 编辑项目：{target['name']}")
-            with st.form(f"edit_project_form_{eid}"):
-                ncode = st.text_input("项目编号（必填，唯一）", value=target.get("code") or "")
-                nname = st.text_input("项目名称（必填）", value=target.get("name") or "")
-                ndesc = st.text_area("项目描述（可选，留空即清空）", value=target.get("description") or "")
-                _cur_stage = target.get("stage") or "项目立项"
-                _stage_idx = PROJECT_STAGES.index(_cur_stage) if _cur_stage in PROJECT_STAGES else 0
-                nstage = st.selectbox("项目阶段", PROJECT_STAGES, index=_stage_idx)
-                _cur_year = target.get("start_year")
-                try:
-                    _cur_year_int = int(_cur_year) if _cur_year not in (None, "") else None
-                except (TypeError, ValueError):
-                    _cur_year_int = None
-                clear_year = st.checkbox("清空立项年份（设为「未标注年份」）", value=False)
-                nyear = st.number_input(
-                    "立项年份", min_value=1990, max_value=2100,
-                    value=_cur_year_int, step=1, disabled=clear_year,
-                )
-                submitted = st.form_submit_button("💾 保存修改")
-
-            if submitted:
-                if not (ncode or "").strip() or not (nname or "").strip():
-                    st.error("项目编号和项目名称是必填的！")
-                else:
-                    _payload = {
-                        "code": (ncode or "").strip(),
-                        "name": (nname or "").strip(),
-                        "description": ndesc,
-                        "stage": nstage,
-                        "start_year": None if clear_year else (int(nyear) if nyear else None),
-                    }
-                    resp = api_update_project(eid, _payload)
-                    if resp is None:
-                        st.error("无法连接后端")
-                    elif resp.status_code == 200:
-                        st.success("项目已更新")
-                        st.session_state["edit_project_id"] = None
-                        st.rerun()
-                    else:
-                        try:
-                            st.error(resp.json().get("detail", "更新失败"))
-                        except Exception:
-                            st.error(f"更新失败：{resp.text}")
-
-            if st.button("❌ 取消编辑", key=f"cancel_edit_{eid}"):
-                st.session_state["edit_project_id"] = None
-                st.rerun()
+                        # 编辑表单紧跟选中的项目行，就地展开
+                        if _edit_id == p["id"]:
+                            _project_edit_block(p)
 
     # 二次确认：点击上面的"删除"后，这里会出现确认/取消按钮
     if "confirm_del_project" in st.session_state and st.session_state["confirm_del_project"] is not None:
@@ -1937,10 +2263,10 @@ elif menu == "➕ 创建项目":
     st.header("创建新项目")
 
     with st.form("create_project_form"):
-        code = st.text_input("项目编号（必填，唯一）", placeholder="例如：P002")
-        name = st.text_input("项目名称（必填）", placeholder="例如：科技项目名称")
-        description = st.text_area("项目描述（可选）", placeholder="简单介绍一下这个项目……")
-        stage = st.selectbox("项目阶段", PROJECT_STAGES, index=0)
+        code = st.text_input("项目编号（必填，唯一）", placeholder="例如：P002", key="auto_w_2082")
+        name = st.text_input("项目名称（必填）", placeholder="例如：科技项目名称", key="auto_w_2083")
+        description = st.text_area("项目描述（可选）", placeholder="简单介绍一下这个项目……", key="auto_w_2084")
+        stage = st.selectbox("项目阶段", PROJECT_STAGES, index=0, key="auto_w_2085")
         start_year = st.number_input(
             "立项年份（可选，不填 = 未标注）",
             min_value=1990,
@@ -2034,7 +2360,14 @@ elif menu == "📁 文件管理":
                         for f in uploaded:
                             resp = api_upload_file(project_id, f)
                             if resp.status_code == 200:
-                                ok_list.append(f.name)
+                                try:
+                                    _fid = resp.json().get("id")
+                                except Exception:
+                                    _fid = None
+                                if _fid:
+                                    ok_list.append(f.name)
+                                else:
+                                    fail_list.append(f"{f.name}（后端未返回文件ID，可能未入库）")
                             else:
                                 fail_list.append(f"{f.name}（{resp.text}）")
                     if ok_list:
@@ -2254,13 +2587,38 @@ elif menu == "📌 项目管理":
             # ① 信息卡
             _sy = _proj.get("start_year")
             _sy_text = f"{int(_sy)} 年" if _sy else "未标注"
+            _done = int(_proj.get("completed") or 0)
             with st.container(border=True):
                 st.markdown(f"### 📁 {_proj.get('name', '')}")
                 st.caption(
                     f"编号：{_proj.get('code', '')}　｜　当前阶段：{_proj.get('stage', '项目立项')}"
+                    f"　｜　状态：{'✅ 已完结' if _done else '🟢 进行中'}"
                     f"　｜　立项年份：{_sy_text}　｜　创建于 {_proj.get('created_at', '')}"
                 )
                 st.write(_proj.get("description") or "（无描述）")
+
+                if _done:
+                    st.success(f"✅ 该项目已于 {_proj.get('completed_at') or '—'} 完结。"
+                               f"完结说明：{_proj.get('completion_note') or '（未填写）'}")
+                    st.caption("已完结项目不再显示合同/付款/延期/质保/超额等风险提醒；历史数据保留可查。")
+                    if st.button("↩️ 重新开启项目", key=f"pm_reopen_{project_id}"):
+                        _r = api_reopen_project(project_id)
+                        if _r is not None and _r.status_code == 200:
+                            st.success("已重新开启")
+                            st.rerun()
+                        elif _r is not None:
+                            st.error(f"开启失败：{_r.text}")
+                else:
+                    with st.expander("🏁 项目完结", expanded=False):
+                        st.caption("完结后自动隐藏该项目的风险提醒；项目/合同/经费/成果历史数据全部保留。")
+                        _cnote = st.text_area("完结说明 / 验收结论（可选）", key=f"pm_complete_note_{project_id}")
+                        if st.button("✅ 确认完结", type="primary", key=f"pm_complete_{project_id}"):
+                            _r = api_complete_project(project_id, _cnote)
+                            if _r is not None and _r.status_code == 200:
+                                st.success("项目已完结")
+                                st.rerun()
+                            elif _r is not None:
+                                st.error(f"完结失败：{_r.text}")
 
                 # 补录/修改立项年份（存量项目可在此补录）
                 with st.expander("✏️ 修改立项年份", expanded=False):
@@ -2286,7 +2644,7 @@ elif menu == "📌 项目管理":
             _m1.metric("文件数", _metrics.get("file_count", 0))
             _m2.metric("合同数", _metrics.get("contract_count", 0))
             _m3.metric("合同总金额", fmt_money(_metrics.get("contract_total_amount", 0)))
-            _m4.metric("经费投入", fmt_money(_metrics.get("funding_income", 0)))
+            _m4.metric("研发投入（支出）", fmt_money(_metrics.get("funding_expense", 0)))
             _m5.metric("成果数", _metrics.get("achievement_count", 0))
             _m6.metric("待办数", _metrics.get("todo_count", 0))
 
@@ -2353,622 +2711,7 @@ elif menu == "📑 合同管理":
 
 # ============ 页面4.1：经费管理 ============
 elif menu == "💰 经费管理":
-    st.header("💰 经费管理")
-    st.caption("年度经费一览表：按「项目 × 月份」录入投入金额、经费科目、发生日期与支撑材料附件")
-
-    from datetime import datetime as _dt
-    import pandas as pd
-
-    # ===== 年度经费一览表（前置到页面顶部：年度选择 → 新增项目行 → 总览 → 矩阵 → 单元格录入 → 行管理）=====
-    cur_year = _dt.now().year
-    year_opts = list(range(cur_year - 2, cur_year + 3))
-    year = st.selectbox("📅 年度", year_opts, index=year_opts.index(cur_year), key="fund_grid_year")
-
-    grid = api_funding_grid(year)
-    projects = api_list_projects()
-    rows = (grid or {}).get("rows", [])
-    cells = (grid or {}).get("cells", {})
-    attachments = (grid or {}).get("attachments", {})
-    contract_amounts = (grid or {}).get("contract_amounts", {})
-    summary = api_funding_grid_summary()
-    cross_map = {p["project_id"]: p for p in (summary or {}).get("projects", [])}
-
-    # —— 新增项目行 ——
-    with st.container(border=True):
-        st.subheader("➕ 新增项目行")
-        if not projects:
-            st.warning("暂无项目，请先到「项目列表」创建项目。")
-        else:
-            existing_ids = {r["project_id"] for r in rows}
-            avail = [p for p in projects if p["id"] not in existing_ids]
-            if not avail:
-                st.info("所有项目都已添加。")
-            else:
-                p_labels = {}
-                for p in avail:
-                    lbl = f"{p['name']}（ID:{p['id']}）"
-                    other_years = [y for y in cross_map.get(p["id"], {}).get("years", []) if y != year]
-                    if other_years:
-                        lbl += f"　｜已在 {'/'.join(map(str, other_years))} 年有经费"
-                    p_labels[lbl] = p["id"]
-                c1, c2 = st.columns([4, 1])
-                sel_label = c1.selectbox("选择项目", list(p_labels.keys()), key="fund_grid_add_proj")
-                if c2.button("➕ 添加", key="fund_grid_add_btn", use_container_width=True):
-                    r = api_add_funding_row(year, p_labels[sel_label])
-                    if r and r.status_code == 200:
-                        st.rerun()
-                    elif r is not None:
-                        st.error(r.text)
-
-    st.divider()
-
-    # —— 项目全周期经费总览（跨年自动汇总）——
-    if summary and summary.get("projects"):
-        years_all = summary.get("years_all", [])
-        with st.expander(
-            f"🔭 项目全周期经费总览（跨年汇总）· {summary['total_count']} 个项目，{summary['cross_year_count']} 个跨年",
-            expanded=False,
-        ):
-            st.caption("跨年项目自动按年度汇总，一屏看清项目从立项到验收的全周期经费投入")
-            col_names = ["项目"] + [f"{y} 年" for y in years_all] + ["总计", "跨年"]
-            data = []
-            for p in summary["projects"]:
-                row_vals = [p["project_name"]]
-                for y in years_all:
-                    v = p["year_totals"].get(str(y), 0)
-                    row_vals.append(f"{v:,.0f}" if v else "")
-                row_vals.append(f"{p['total']:,.0f}" if p["total"] else "")
-                row_vals.append(f"跨 {p['year_count']} 年" if p["is_cross_year"] else "—")
-                data.append(row_vals)
-            sdf = pd.DataFrame(data, columns=col_names)
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
-
-    # —— 矩阵总览 + 合同金额（暂估/结算/到账，可人工修改）——
-    st.subheader("📊 年度经费一览表")
-    st.caption("横向 1~12 月，纵向为项目；单元格显示当月投入金额，📎 表示已上传支撑材料附件")
-    if not rows:
-        st.info("请先在上方「新增项目行」添加项目，即可按月份录入经费。")
-    else:
-        col_names = ["项目"] + [f"{m}月" for m in range(1, 13)] + ["合计"]
-        data = []
-        for r in rows:
-            pid = r["project_id"]
-            row_vals = [r["project_name"]]
-            total = 0.0
-            for m in range(1, 13):
-                cell = cells.get(f"{pid}-{m}")
-                atts = attachments.get(f"{pid}-{m}", [])
-                amt = (cell or {}).get("amount")
-                if amt:
-                    total += amt
-                    s = f"{amt:,.0f}"
-                    if atts:
-                        s += f" 📎×{len(atts)}"
-                    row_vals.append(s)
-                elif atts:
-                    row_vals.append(f"📎×{len(atts)}")
-                else:
-                    row_vals.append("")
-            row_vals.append(f"{total:,.0f}" if total else "")
-            data.append(row_vals)
-        df = pd.DataFrame(data, columns=col_names)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # —— 合同金额两行（暂估 / 结算 + 到账）+ 合同清单 + 就地人工修改（默认折叠，避免页面冗余）——
-        with st.expander("💴 合同金额（年度口径，可人工修改；修改后 override 优先于自动值）", expanded=False):
-            st.caption("逐项目展示合同暂估额 / 结算额 / 到账额，点「修改」就地编辑；默认折叠以免页面过长。")
-            for r in rows:
-                pid = r["project_id"]
-                ca = contract_amounts.get(str(pid), {})
-                est = ca.get("estimate", 0); est_ov = ca.get("estimate_override", False)
-                stl = ca.get("settlement", 0); stl_ov = ca.get("settlement_override", False)
-                inc = ca.get("income", 0); inc_ov = ca.get("income_override", False)
-                mark_est = "　*（已人工修改）*" if est_ov else ""
-                mark_stl = "　*（已人工修改）*" if stl_ov else ""
-                mark_inc = "　*（已人工修改）*" if inc_ov else ""
-                with st.container(border=True):
-                    st.markdown(f"**{r['project_name']}**")
-                    r1c1, r1c2 = st.columns([4, 1])
-                    r1c1.markdown(f"合同暂估额：{fmt_money(est)}{mark_est}")
-                    if r1c2.button("✏️ 修改暂估", key=f"ov_est_{pid}_{year}", use_container_width=True):
-                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "estimate", "label": "合同暂估额"}
-                    r2c1, r2c2, r2c3 = st.columns([4, 1, 1])
-                    r2c1.markdown(f"实际入账额：合同结算金额 {fmt_money(stl)}{mark_stl} ｜ 实际到账流水 {fmt_money(inc)}{mark_inc}")
-                    if r2c2.button("✏️ 修改结算", key=f"ov_stl_{pid}_{year}", use_container_width=True):
-                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "settlement", "label": "合同结算金额"}
-                    if r2c3.button("✏️ 修改到账", key=f"ov_inc_{pid}_{year}", use_container_width=True):
-                        st.session_state["override_edit"] = {"project_id": pid, "year": year, "kind": "income", "label": "实际到账流水"}
-
-                    # 就地渲染编辑表单（点击「修改」后立即出现在本项目卡片内）
-                    ov_edit = st.session_state.get("override_edit")
-                    if ov_edit and ov_edit.get("project_id") == pid and ov_edit.get("year") == year:
-                        _cur = {"estimate": est, "settlement": stl, "income": inc}.get(ov_edit["kind"], 0.0)
-                        _inp_key = f"ov_input_{ov_edit['kind']}_{pid}_{year}"
-                        with st.form(f"override_form_{ov_edit['kind']}_{pid}_{year}"):
-                            st.markdown(f"**人工修改：{ov_edit['label']}**（当前自动值 {fmt_money(_cur)}）")
-                            new_val = st.number_input("金额（元）", min_value=0.0, step=1000.0, format="%.2f",
-                                                      value=float(_cur or 0.0), key=_inp_key)
-                            oc1, oc2, oc3 = st.columns([1, 1, 1])
-                            save_ov = oc1.form_submit_button("💾 保存")
-                            reset_ov = oc2.form_submit_button("↩️ 恢复自动值")
-                            cancel_ov = oc3.form_submit_button("取消")
-                        if save_ov:
-                            r = api_save_contract_amount_override({"project_id": pid, "year": year,
-                                                                   "kind": ov_edit["kind"], "amount": new_val})
-                            if r and r.status_code == 200:
-                                st.session_state.pop("override_edit", None)
-                                st.session_state.pop(_inp_key, None)
-                                st.rerun()
-                            elif r is not None:
-                                st.error(r.text)
-                        if reset_ov:
-                            r = api_save_contract_amount_override({"project_id": pid, "year": year,
-                                                                   "kind": ov_edit["kind"], "amount": None})
-                            if r and r.status_code == 200:
-                                st.session_state.pop("override_edit", None)
-                                st.session_state.pop(_inp_key, None)
-                                st.rerun()
-                            elif r is not None:
-                                st.error(r.text)
-                        if cancel_ov:
-                            st.session_state.pop("override_edit", None)
-                            st.session_state.pop(_inp_key, None)
-                            st.rerun()
-
-                    clist = ca.get("contracts", [])
-                    with st.expander(f"合同清单（{len(clist)} 份）"):
-                        if not clist:
-                            st.caption("该项目暂无关联合同")
-                        else:
-                            crows = [{
-                                "合同名称": _contract_display_name(cc),
-                                "合同编号": cc.get("contract_no") or "",
-                                "含税金额": fmt_money(cc.get("amount_incl_tax")),
-                                "签订日期": cc.get("sign_date") or "",
-                                "本年暂估": fmt_money(cc.get("estimate")),
-                                "本年结算": fmt_money(cc.get("settlement")),
-                            } for cc in clist]
-                            st.dataframe(pd.DataFrame(crows), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # —— 单元格录入 / 编辑 ——
-    if rows:
-        st.subheader("✏️ 单元格录入 / 编辑")
-        st.caption("选择项目与月份，录入该月投入金额、经费科目、发生日期，并上传/下载该月支撑材料附件")
-        row_map = {r["project_id"]: r for r in rows}
-        e1, e2 = st.columns(2)
-        sel_pid = e1.selectbox("项目", [r["project_id"] for r in rows],
-                               format_func=lambda pid: row_map[pid]["project_name"], key="fg_sel_proj")
-        sel_month = e2.selectbox("月份", list(range(1, 13)), format_func=lambda m: f"{m} 月", key="fg_sel_month")
-
-        cell = cells.get(f"{sel_pid}-{sel_month}")
-        atts = attachments.get(f"{sel_pid}-{sel_month}", [])
-
-        with st.container(border=True):
-            with st.form("funding_cell_form"):
-                fc1, fc2 = st.columns(2)
-                amt = fc1.number_input("投入金额（元）", min_value=0.0, step=1000.0,
-                                       value=float((cell or {}).get("amount") or 0.0), format="%.2f")
-                fund_date = fc2.text_input("经费发生日期", value=(cell or {}).get("fund_date") or "", placeholder="如：2026-03-15")
-                item_name = st.text_input("经费科目 / 名称", value=(cell or {}).get("item_name") or "", placeholder="如：省拨经费、设备费、劳务费")
-                save_cell = st.form_submit_button("💾 保存该单元格", use_container_width=True)
-            if save_cell:
-                r = api_save_funding_cell({
-                    "year": year, "project_id": sel_pid, "month": sel_month,
-                    "amount": amt, "item_name": item_name, "fund_date": fund_date,
-                })
-                if r and r.status_code == 200:
-                    st.success("已保存")
-                    st.rerun()
-                elif r is not None:
-                    st.error(r.text)
-
-            st.markdown("**📎 支撑材料附件**（精确关联「项目 + 月份」）")
-            if atts:
-                for a in atts:
-                    ac1, ac2 = st.columns([5, 1])
-                    tok = st.session_state.get("token", "")
-                    ac1.markdown(f"📄 `{a['file_name']}`　[⬇️ 下载]({API_BASE}{a['download_url']}?token={tok})")
-                    if ac2.button("🗑️", key=f"fg_att_del_{a['id']}", use_container_width=True):
-                        api_delete_funding_attachment(a["id"])
-                        st.rerun()
-            else:
-                st.caption("（该单元格暂无附件）")
-            up_files = st.file_uploader("上传附件（可多选）", key=f"fg_att_up_{sel_pid}_{sel_month}", accept_multiple_files=True)
-            if st.button("⬆️ 上传附件", key="fg_att_up_btn", use_container_width=True):
-                if not up_files:
-                    st.warning("请先选择要上传的文件")
-                else:
-                    r = api_upload_funding_attachments(year, sel_pid, sel_month, up_files)
-                    if r and r.status_code == 200:
-                        d = r.json()
-                        st.success(f"已上传 {len(d.get('uploaded', []))} 个附件")
-                        st.rerun()
-                    elif r is not None:
-                        st.error(r.text)
-
-        st.divider()
-
-        # —— 行管理（删除 / 调整顺序）——
-        st.subheader("🗂️ 项目行管理（删除 / 调整顺序）")
-        for i, r in enumerate(rows):
-            c1, c2, c3, c4 = st.columns([4, 1, 1, 1])
-            c1.markdown(f"**{r['project_name']}**")
-            if c2.button("⬆️ 上移", key=f"fg_up_{r['id']}", disabled=(i == 0), use_container_width=True):
-                api_move_funding_row(r["id"], "up")
-                st.rerun()
-            if c3.button("⬇️ 下移", key=f"fg_down_{r['id']}", disabled=(i == len(rows) - 1), use_container_width=True):
-                api_move_funding_row(r["id"], "down")
-                st.rerun()
-            if c4.button("🗑️ 删除", key=f"fg_del_{r['id']}", use_container_width=True):
-                st.session_state["fg_confirm_del_row"] = r["id"]
-
-        if st.session_state.get("fg_confirm_del_row"):
-            del_pid = st.session_state["fg_confirm_del_row"]
-            del_row = next((r for r in rows if r["id"] == del_pid), None)
-            del_name = del_row["project_name"] if del_row else f"#{del_pid}"
-            st.warning(f"⚠️ 确定删除项目「{del_name}」这一行吗？该行所有月份的经费数据与附件都会一并删除，且无法恢复！")
-            d1, d2 = st.columns([1, 1])
-            if d1.button("✅ 确认删除", key="fg_del_confirm_yes"):
-                api_delete_funding_row(del_pid)
-                st.session_state.pop("fg_confirm_del_row", None)
-                st.rerun()
-            if d2.button("❌ 取消", key="fg_del_confirm_no"):
-                st.session_state.pop("fg_confirm_del_row", None)
-                st.rerun()
-
-    st.divider()
-
-    # ============ 新增：经费智能提取 / 比对 / 预警 ============
-    with st.expander("⚙️ 经费口径配置（最终填充金额 / 超额基准 / 延期基准 / 容忍比例）", expanded=False):
-        cfg = api_get_config()
-        with st.form("fund_cfg_form"):
-            cc1, cc2 = st.columns(2)
-            basis_opts = {"发票额（默认）": "invoice", "暂估额": "estimate", "三列并存": "both"}
-            cur_basis = cfg.get("final_amount_basis", "invoice")
-            new_basis = cc1.selectbox(
-                "最终填充金额口径", list(basis_opts.keys()),
-                index=list(basis_opts.values()).index(cur_basis) if cur_basis in basis_opts.values() else 0,
-            )
-            ob_opts = {"合同含税金额（默认）": "contract_incl_tax", "项目预算总额": "project_budget"}
-            cur_ob = cfg.get("overrun_basis", "contract_incl_tax")
-            new_ob = cc2.selectbox(
-                "超额判定基准", list(ob_opts.keys()),
-                index=list(ob_opts.values()).index(cur_ob) if cur_ob in ob_opts.values() else 0,
-            )
-            tol = st.number_input("超额容忍比例（如 0.05 表示超 5% 才报警）", min_value=0.0, max_value=1.0,
-                                  step=0.01, value=float(cfg.get("overrun_tolerance", "0.0") or 0))
-            submit_cfg = st.form_submit_button("💾 保存口径配置")
-        if submit_cfg:
-            r = api_update_config({
-                "final_amount_basis": basis_opts[new_basis],
-                "overrun_basis": ob_opts[new_ob],
-                "overrun_tolerance": str(tol),
-            })
-            if r and r.status_code == 200:
-                st.success("配置已保存")
-                st.rerun()
-            elif r is not None:
-                st.error(r.text)
-
-    st.divider()
-
-    # —— 经费智能比对（选项目带出合同金额/日期 + 财务资料 + 超额预警）——
-    st.subheader("📑 经费智能比对")
-    st.caption("选项目自动带出合同金额与日期；上传暂估单/结算单/发票自动提取金额税额日期，发票覆盖暂估结算，累计实际额 vs 合同含税额自动比对")
-
-    _projs_all = api_list_projects()
-    _proj_filter = {"（全部项目）": None}
-    _proj_filter.update({f"{p['name']}（ID:{p['id']}）": p["id"] for p in _projs_all})
-    # 跳转预选：从项目管理页跳转时按 current_project_id 预选
-    _f_cpid = st.session_state.get("current_project_id")
-    if _f_cpid is not None and st.session_state.get("_fund_filter_for") != _f_cpid:
-        _target = next((lbl for lbl, pid in _proj_filter.items() if pid == _f_cpid), "（全部项目）")
-        st.session_state["fund_cmp_proj"] = _target
-        st.session_state["_fund_filter_for"] = _f_cpid
-    sel_pf = st.selectbox("选择项目", list(_proj_filter.keys()), key="fund_cmp_proj")
-    cmp_pid = _proj_filter[sel_pf]
-
-    cmp = api_funding_compare(cmp_pid)
-    if cmp:
-        contracts = cmp.get("contracts", [])
-        if not contracts:
-            st.info("该项目暂无关联合同。请先在「合同管理」上传合同并关联项目。")
-        else:
-            tot = cmp.get("totals", {})
-            t1, t2, t3, t4 = st.columns(4)
-            t1.metric("合同含税总额", f"¥{tot.get('contract_incl_tax', 0):,.0f}")
-            t2.metric("暂估合计", f"¥{tot.get('estimate', 0):,.0f}")
-            t3.metric("结算合计", f"¥{tot.get('settlement', 0):,.0f}")
-            t4.metric("发票合计", f"¥{tot.get('invoice', 0):,.0f}")
-
-            projs = cmp.get("projects", [])
-            if projs:
-                import pandas as pd
-                prows = []
-                for p in projs:
-                    prows.append({
-                        "项目": p["project_name"], "合同数": p["contract_count"],
-                        "合同含税额": f"¥{p['contract_incl_tax']:,.0f}",
-                        "实际发生额": f"¥{p['effective']:,.0f}",
-                        "差异": f"¥{p['diff']:,.0f}",
-                        "进度": (f"{p['progress_pct']}%" if p['progress_pct'] is not None else "—"),
-                        "超额": "🔴 是" if p["overrun"] else "否",
-                    })
-                st.markdown("**按项目汇总**")
-                st.dataframe(pd.DataFrame(prows), use_container_width=True, hide_index=True)
-
-            crows = []
-            for c in contracts:
-                crows.append({
-                    "合同": _contract_display_name(c),
-                    "乙方/合作方": c["party_b"] or "",
-                    "含税金额": c["amount_incl_tax"],
-                    "暂估": c["estimate_total"], "结算": c["settlement_total"], "发票": c["invoice_total"],
-                    "最终金额": c["effective_total"] if c["effective_total"] is not None else "—",
-                    "差异": c["diff_vs_contract"] if c["diff_vs_contract"] is not None else "—",
-                    "签订日期": c["sign_date"], "到期日": c["due_date"],
-                })
-            st.markdown("**按合同明细**")
-            st.dataframe(pd.DataFrame(crows), use_container_width=True, hide_index=True)
-
-            for a in cmp.get("alerts", []):
-                if a.get("category") == "超额":
-                    st.error(f"🔴 {a['title']}：{a['detail']}")
-
-    st.divider()
-
-    # —— 自动归集的财务单据（文件库中识别出的发票/结算单/暂估单/估算单等）——
-    st.subheader("📎 自动归集的财务单据")
-    st.caption("文件管理上传时自动识别归集的财务单据（发票 / 结算单 / 暂估单 / 估算单等），此处汇总引用，可一键下载")
-    fin_files = api_financial_files()
-    if fin_files:
-        fin_items = fin_files.get("items", [])
-        by_type = fin_files.get("by_type", {})
-        if fin_items:
-            m1, m2 = st.columns(2)
-            m1.metric("财务单据总数", len(fin_items))
-            m2.metric("金额合计", f"¥{fin_files.get('total_amount', 0):,.2f}")
-            if by_type:
-                st.caption("　".join(f"{k}：¥{v:,.2f}" for k, v in by_type.items()))
-            _fin_rows = [{
-                "项目": it.get("project_name") or "",
-                "类型": it.get("doc_type") or "其他财务单据",
-                "金额": it.get("amount") or 0,
-                "发生日期": it.get("doc_date") or "",
-                "文件": it.get("original_name") or "",
-            } for it in fin_items]
-            st.dataframe(pd.DataFrame(_fin_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("文件库中暂未识别到财务单据。上传发票 / 结算单 / 暂估单 / 估算单等文件后会自动归集到这里。")
-    else:
-        st.info("文件库中暂未识别到财务单据。")
-
-    # —— 财务资料上传 / 校对 ——
-    st.subheader("🧾 财务资料（暂估单 / 结算单 / 发票）")
-    st.caption("1 合同 → 多张暂估/结算/发票；一张发票只对应一个合同；识别结果须人工校对确认")
-    contracts_all = api_list_contracts()
-    if not contracts_all:
-        st.info("暂无合同，请先在「合同管理」上传合同。")
-    else:
-        with st.container(border=True):
-            upload_mode = st.radio("上传方式", ["按项目上传（推荐）", "按合同上传"], horizontal=True, key="fin_upload_mode")
-            if upload_mode == "按项目上传（推荐）":
-                _projs_for_fin = api_list_projects()
-                _fin_proj_opts = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in _projs_for_fin}
-                if not _fin_proj_opts:
-                    st.warning("暂无项目，请先创建项目。")
-                else:
-                    sel_proj_label = st.selectbox("选择项目", list(_fin_proj_opts.keys()), key="fin_proj_upload")
-                    sel_proj_id = _fin_proj_opts[sel_proj_label]
-                    proj_contracts = [c for c in contracts_all if c.get("project_id") == sel_proj_id]
-                    if not proj_contracts:
-                        st.warning("该项目暂无关联合同，请先在「合同管理」关联项目。")
-                    else:
-                        ct_labels = {_contract_display_label(c, with_project=False): c["id"] for c in proj_contracts}
-                        default_labels = list(ct_labels.keys())
-                        sel_cts = st.multiselect("关联合同（默认全选）", list(ct_labels.keys()), default=default_labels, key="fin_proj_cts")
-                        sel_dt = st.selectbox("单据类型", ["发票", "结算单", "暂估单"], key="fin_proj_dt")
-                        up_files = st.file_uploader("选择单据文件（可多选）", accept_multiple_files=True, key="fin_proj_uploader")
-                        if st.button("⬆️ 上传并解析", key="fin_proj_up_btn", use_container_width=True):
-                            if not up_files:
-                                st.warning("请先选择要上传的单据文件")
-                            elif not sel_cts:
-                                st.warning("请至少选择一个关联合同")
-                            else:
-                                selected_ct_ids = [ct_labels[l] for l in sel_cts]
-                                # 文件名含合同名/编号关键字自动匹配；未命中归入多选第一个合同
-                                groups = {}
-                                for f in up_files:
-                                    matched_id = None
-                                    for c in proj_contracts:
-                                        if c["id"] not in selected_ct_ids:
-                                            continue
-                                        if (c.get("contract_name") and c["contract_name"] in f.name) or \
-                                           (c.get("contract_no") and c["contract_no"] in f.name):
-                                            matched_id = c["id"]
-                                            break
-                                    if matched_id is None:
-                                        matched_id = selected_ct_ids[0]
-                                    groups.setdefault(matched_id, []).append(f)
-                                with st.spinner("正在上传并解析财务单据……"):
-                                    ok_all, err_all = 0, []
-                                    for cid, gfiles in groups.items():
-                                        r = api_upload_financial_docs(cid, sel_dt, sel_proj_id, gfiles)
-                                        if r and r.status_code == 200:
-                                            d = r.json()
-                                            ok_all += len(d.get("uploaded", []))
-                                            err_all += [e.get("filename", "") for e in d.get("errors", [])]
-                                        elif r is not None:
-                                            err_all.append(r.text)
-                                st.success(f"已上传 {ok_all} 份，正在后台提取金额/税额/日期")
-                                if err_all:
-                                    st.warning(f"部分失败：{'；'.join(err_all)}")
-                                st.rerun()
-            else:
-                fu1, fu2, fu3 = st.columns(3)
-                ct_opts = {_contract_display_label(c, with_project=True): c["id"] for c in contracts_all}
-                sel_ct = fu1.selectbox("关联合同", list(ct_opts.keys()), key="fin_doc_ct")
-                sel_dt = fu2.selectbox("单据类型", ["发票", "结算单", "暂估单"], key="fin_doc_type")
-                up_files = fu3.file_uploader("选择单据文件（可多选）", accept_multiple_files=True, key="fin_doc_uploader")
-                if st.button("⬆️ 上传并解析", key="fin_doc_up_btn", use_container_width=True):
-                    if not up_files:
-                        st.warning("请先选择要上传的单据文件")
-                    else:
-                        with st.spinner("正在上传并解析财务单据……"):
-                            r = api_upload_financial_docs(ct_opts[sel_ct], sel_dt, None, up_files)
-                        if r and r.status_code == 200:
-                            d = r.json()
-                            st.success(f"已上传 {len(d.get('uploaded', []))} 份，正在后台提取金额/税额/日期")
-                            st.rerun()
-                        elif r is not None:
-                            st.error(r.text)
-
-        docs = api_list_financial_docs()
-        if docs:
-            st.markdown("**财务资料清单**（可人工校对确认）")
-            for d in docs:
-                status = "✅ 已确认" if d.get("confirmed") else "🕓 待确认"
-                with st.expander(f"{status} {d['doc_type']} ｜ {d['original_name']} ｜ 金额 ¥{d.get('amount') or 0:,.2f}"):
-                    if d.get("remark"):
-                        st.caption(f"📝 {d['remark']}")
-                    with st.form(f"fin_doc_form_{d['id']}"):
-                        f1, f2, f3 = st.columns(3)
-                        n_amt = f1.number_input("金额（价税合计）", value=float(d.get("amount") or 0), step=100.0, format="%.2f")
-                        n_tax = f2.number_input("税额", value=float(d.get("tax_amount") or 0), step=10.0, format="%.2f")
-                        n_date = f3.text_input("发生日期", value=d.get("doc_date") or "", placeholder="YYYY-MM-DD")
-                        fs = st.form_submit_button("💾 保存校对")
-                    if fs:
-                        r = api_update_financial_doc(d["id"], {"amount": n_amt, "tax_amount": n_tax, "doc_date": n_date})
-                        if r and r.status_code == 200:
-                            st.success("已保存")
-                            st.rerun()
-                        elif r is not None:
-                            st.error(r.text)
-                    bc1, bc2 = st.columns(2)
-                    if not d.get("confirmed"):
-                        if bc1.button("✅ 确认生效", key=f"fin_doc_cf_{d['id']}"):
-                            api_confirm_financial_doc(d["id"])
-                            st.rerun()
-                    if bc2.button("🗑️ 删除", key=f"fin_doc_del_{d['id']}"):
-                        api_delete_financial_doc(d["id"])
-                        st.rerun()
-
-    st.divider()
-
-    # —— 风险预警 ——
-    alerts = api_funding_alerts()
-    if alerts:
-        al = alerts.get("alerts", [])
-        with st.expander(f"⚠️ 风险预警（{len(al)} 条）", expanded=bool(al)):
-            if not al:
-                st.success("🎉 当前无风险预警")
-            else:
-                if st.button("🧹 批量清理已过期提醒", key="alert_dismiss_expired"):
-                    r = api_dismiss_expired_alert()
-                    if r and r.status_code == 200:
-                        st.success(f"已清理 {r.json().get('dismissed_count', 0)} 条过期提醒")
-                        st.rerun()
-                    elif r is not None:
-                        st.error(r.text)
-                for a in al:
-                    lvl = a.get("level", "info")
-                    color = {"danger": "#e53935", "warning": "#f59e0b", "info": "#3b82f6"}.get(lvl, "#3b82f6")
-                    icon = {"danger": "🔴", "warning": "🟡", "info": "🔵"}.get(lvl, "🔵")
-                    acol1, acol2 = st.columns([9, 1])
-                    acol1.markdown(
-                        f'<div style="border-left:4px solid {color};padding:8px 12px;margin:6px 0;background:#f7f8fa;border-radius:4px;">'
-                        f'{icon} <b>{html.escape(a.get("category", ""))}</b> ｜ {html.escape(a.get("title", ""))}<br>'
-                        f'<span style="color:#5f6368;font-size:0.9em;">{html.escape(a.get("detail", ""))}</span></div>',
-                        unsafe_allow_html=True,
-                    )
-                    if acol2.button("🔕 不再提醒", key=f"alert_dismiss_{a.get('alert_key', a.get('source_id', ''))}", help="关闭该条预警，后续不再显示"):
-                        r = api_dismiss_alert(a.get("alert_key"), a.get("category"))
-                        if r and r.status_code == 200:
-                            st.rerun()
-                        elif r is not None:
-                            st.error(r.text)
-
-    st.divider()
-
-    # —— 旧经费收支明细（预算 / 到账 / 支出，折叠保留，数据大屏仍引用）——
-    with st.expander("💼 经费收支明细（预算 / 到账 / 支出）", expanded=False):
-        _projects = api_list_projects()
-        _project_options = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in _projects}
-        _project_options["（平台级 / 不关联项目）"] = None
-
-        with st.container(border=True):
-            st.subheader("➕ 录入经费收支")
-            with st.form("funding_form"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    proj_label = st.selectbox("所属项目", list(_project_options.keys()), key="fund_proj")
-                    item_name = st.text_input("经费科目 / 名称", placeholder="如：省拨经费、设备费、劳务费")
-                with c2:
-                    fund_type = st.selectbox("类型", ["到账", "支出", "预算"], key="fund_type")
-                    amount = st.number_input("金额（元）", min_value=0.0, step=1000.0, format="%.2f")
-                fund_date = st.text_input("日期（可选）", placeholder="如：2026-09-27")
-                remark = st.text_input("备注（可选）")
-                submitted = st.form_submit_button("保存")
-            if submitted:
-                if not item_name.strip():
-                    st.error("请填写经费科目")
-                elif amount <= 0:
-                    st.error("金额需大于 0")
-                else:
-                    resp = api_create_funding({
-                        "project_id": _project_options[proj_label],
-                        "item_name": item_name.strip(),
-                        "fund_type": fund_type,
-                        "amount": amount,
-                        "fund_date": fund_date.strip() or None,
-                        "remark": remark.strip() or None,
-                    })
-                    if resp is None:
-                        pass
-                    elif resp.status_code == 200:
-                        st.success("已保存")
-                        st.rerun()
-                    else:
-                        st.error(f"保存失败：{resp.text}")
-
-        _stats = api_funding_stats()
-        if _stats:
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("记录数", _stats.get("total_count", 0))
-            c2.metric("预算总额", f"¥{_stats.get('budget', 0):,.2f}")
-            c3.metric("到账总额", f"¥{_stats.get('income', 0):,.2f}")
-            c4.metric("支出总额", f"¥{_stats.get('expense', 0):,.2f}")
-            c5.metric("结余", f"¥{_stats.get('balance', 0):,.2f}")
-
-        _items = api_list_fundings()
-        if _items:
-            rows = []
-            for f in _items:
-                rows.append({
-                    "ID": f["id"],
-                    "项目": f.get("project_name") or "平台级",
-                    "科目": f["item_name"],
-                    "类型": f["fund_type"],
-                    "金额": f["amount"],
-                    "日期": f.get("fund_date") or "",
-                    "备注": f.get("remark") or "",
-                })
-            _df = pd.DataFrame(rows)
-            st.dataframe(_df, use_container_width=True, hide_index=True)
-
-            st.subheader("🗑️ 删除经费收支记录")
-            _id_map = {f"{f['id']}": f for f in _items}
-            _label_map = {f"{f['id']}": f"#{f['id']}｜{f['item_name']}｜¥{f['amount']}" for f in _items}
-            _sel = st.selectbox("选择要删除的记录", list(_id_map.keys()), format_func=lambda k: _label_map[k], key="fund_del_sel")
-            if st.button("删除所选", key="fund_del_btn"):
-                r = api_delete_funding(int(_sel))
-                if r and r.status_code == 200:
-                    st.success("已删除")
-                    st.rerun()
-                else:
-                    st.error("删除失败")
+    render_funding_page()
 
 # ============ 页面4.2：成果台账 ============
 elif menu == "🏆 成果台账":
@@ -2979,7 +2722,8 @@ elif menu == "🏆 成果台账":
     project_options = {f"{p['name']}（ID:{p['id']}）": p["id"] for p in projects}
     project_options["（平台级 / 不关联项目）"] = None
 
-    cats = ["专利", "论文", "软件著作权", "获奖", "标准", "成果登记", "鉴定报告", "其他"]
+    # 类型列表与筛选维度定义同源（ACH_CATEGORY_PROFILE），避免两处维护不一致
+    cats = ACH_CATEGORIES
     statuses = ["在研", "已授权", "已发表", "已登记", "已获奖", "已发布", "其他"]
 
     # —— 上传成果文件，自动识别 ——
@@ -3017,14 +2761,14 @@ elif menu == "🏆 成果台账":
             c1, c2 = st.columns(2)
             with c1:
                 proj_label = st.selectbox("所属项目", list(project_options.keys()), key="ach_proj")
-                name = st.text_input("成果名称", placeholder="如：一种流域级调速系统协同决策方法")
-                holder = st.text_input("权利人 / 作者（可选）")
+                name = st.text_input("成果名称", placeholder="如：一种流域级调速系统协同决策方法", key="auto_w_3176")
+                holder = st.text_input("权利人 / 作者（可选）", key="auto_w_3177")
             with c2:
                 category = st.selectbox("类型", cats, key="ach_cat")
                 status = st.selectbox("状态", statuses, key="ach_status")
-                application_date = st.text_input("申请日期（可选）", placeholder="如：2026-06-15")
-                achieve_date = st.text_input("取得日期（可选）", placeholder="如：2026-09-27")
-            remark = st.text_input("备注（可选）")
+                application_date = st.text_input("申请日期（可选）", placeholder="如：2026-06-15", key="auto_w_3181")
+                achieve_date = st.text_input("取得日期（可选）", placeholder="如：2026-09-27", key="auto_w_3182")
+            remark = st.text_input("备注（可选）", key="auto_w_3183")
             manual_file = st.file_uploader("附件（可选，如证书扫描件/证明材料）", key="ach_manual_file")
             submitted = st.form_submit_button("保存")
         if submitted:
@@ -3094,74 +2838,205 @@ elif menu == "🏆 成果台账":
         src_map = {"auto": "🤖 自动识别", "manual": "✍️ 手动登记", "file": "📁 文件同步"}
         proc_map = {"done": "✅ 已完成", "processing": "⏳ 识别中", "error": "⚠️ 识别异常"}
 
-        # —— 筛选栏：按关键词 / 类型 / 状态 / 项目 / 取得日期 搜索与筛选 ——
+        # —— 筛选栏：搜索条件按「成果类型」动态核定 ——
+        # 专利 → 受理/申请日起止 + 授权日起止 + 状态 + 关键词 + 项目
+        # 论文 → 发表日期；软件著作权 → 登记日期；鉴定报告 → 鉴定日期；获奖/标准 → 获奖/发布日期
         with st.container(border=True):
-            st.markdown("**🔍 搜索与筛选**")
-            f1, f2 = st.columns([2, 1])
-            with f1:
-                kw = st.text_input("🔍 关键词搜索", placeholder="成果名称 / 权利人 / 备注 / 关联文件", key="ach_filter_kw")
-            with f2:
-                fd1, fd2 = st.columns(2)
-                with fd1:
-                    date_from = st.text_input("取得日期（起）", placeholder="如 2026-01-01", key="ach_filter_date_from")
-                with fd2:
-                    date_to = st.text_input("取得日期（止）", placeholder="如 2026-12-31", key="ach_filter_date_to")
-            f3, f4, f5 = st.columns(3)
-            with f3:
-                f_cats = st.multiselect("类型", cats, default=[], key="ach_filter_cats")
-            with f4:
-                f_statuses = st.multiselect("状态", statuses, default=[], key="ach_filter_statuses")
-            with f5:
-                f_proj = st.selectbox("所属项目", ["全部项目"] + list(project_options.keys()), key="ach_filter_proj")
-            if st.button("🔄 重置", key="ach_filter_reset"):
-                for k in ("ach_filter_kw", "ach_filter_date_from", "ach_filter_date_to",
-                          "ach_filter_cats", "ach_filter_statuses", "ach_filter_proj"):
-                    st.session_state.pop(k, None)
-                st.rerun()
+            st.markdown("**🔍 搜索与筛选**（条件随所选类型自动调整）")
+            with st.expander("📖 各类型的筛选维度是怎么核定的？", expanded=False):
+                _rows = []
+                for _c, _p in ACH_CATEGORY_PROFILE.items():
+                    _dims = "、".join([x for x in [_p["apply_label"], _p["achieve_label"]] if x])
+                    _rows.append(f"| **{_c}** | {_dims}（均支持起止区间） | {'、'.join(_p['statuses']) or '—'} |")
+                st.markdown(
+                    "| 成果类型 | 时间维度 | 状态维度 |\n|---|---|---|\n" + "\n".join(_rows)
+                    + "\n\n- 专利同时具备 **受理 / 申请日** 与 **授权日** 两个时间维度，可分别设区间，并选择「同时满足 / 满足其一即可」；"
+                    + "\n- 其余类型只有「取得日期」一个时间维度，标签按类型显示为其真实业务名；"
+                    + "\n- 类型、状态下拉项均以**台账中真实存在的值**生成并标注条数，不会出现选了却永远没结果的条件。"
+                )
 
-        # 前端过滤（数据量小，直接 Python 过滤；仅作用于「成果明细」表格展示）
-        kw_l = (kw or "").strip().lower()
-        date_from_s = (date_from or "").strip()
-        date_to_s = (date_to or "").strip()
-        filtered = []
-        for a in items:
-            if kw_l:
-                hay = " ".join([
-                    a.get("name") or "",
-                    a.get("holder") or "",
-                    a.get("remark") or "",
-                    a.get("file_name") or "",
-                ]).lower()
-                if kw_l not in hay:
-                    continue
-            if f_cats and (a.get("category") or "") not in f_cats:
-                continue
-            if f_statuses and (a.get("status") or "") not in f_statuses:
-                continue
-            if f_proj != "全部项目" and (a.get("project_id") or None) != project_options[f_proj]:
-                continue
-            d = a.get("achieve_date") or ""
-            if date_from_s and d < date_from_s:
-                continue
-            if date_to_s and d > date_to_s:
-                continue
-            filtered.append(a)
+            # 类型选项以库中真实数据为准，避免硬编码出「选了却永远没结果」的无效条件
+            cat_counter = {}
+            for a in items:
+                k = a.get("category") or "其他"
+                cat_counter[k] = cat_counter.get(k, 0) + 1
+            cat_opts = [c for c in ACH_CATEGORIES if c in cat_counter] \
+                + sorted(c for c in cat_counter if c not in ACH_CATEGORIES)
+            st.session_state["ach_filter_cats"] = [c for c in (st.session_state.get("ach_filter_cats") or []) if c in cat_opts]
 
+            kw = st.text_input(
+                "🔍 关键词（空格分隔多词，需全部命中）",
+                placeholder="成果名称 / 权利人·作者 / 备注 / 关联文件 / 项目名",
+                key="ach_filter_kw")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_cats = st.multiselect(
+                    "类型（不选＝全部类型）", cat_opts,
+                    format_func=lambda c: f"{c}（{cat_counter.get(c, 0)}）",
+                    key="ach_filter_cats")
+
+            # 状态候选随所选类型联动，并带上该范围内的真实条数
+            pool = [a for a in items if (not f_cats) or (a.get("category") or "") in f_cats]
+            st_counter = {}
+            for a in pool:
+                k = a.get("status") or "其他"
+                st_counter[k] = st_counter.get(k, 0) + 1
+            std_statuses = []
+            for c in (f_cats or []):
+                for s in ACH_CATEGORY_PROFILE.get(c, _ACH_DEFAULT_PROFILE)["statuses"]:
+                    if s not in std_statuses:
+                        std_statuses.append(s)
+            st_opts = [s for s in std_statuses if s in st_counter] \
+                + sorted(s for s in st_counter if s not in std_statuses)
+            st.session_state["ach_filter_statuses"] = [s for s in (st.session_state.get("ach_filter_statuses") or []) if s in st_opts]
+            with c2:
+                f_statuses = st.multiselect(
+                    "当前状态（不选＝全部状态）", st_opts,
+                    format_func=lambda s: f"{s}（{st_counter.get(s, 0)}）",
+                    key="ach_filter_statuses")
+
+            # 所属项目：把「未关联项目」单独成项并给出条数（库里大量成果未挂项目）
+            proj_counter = {}
+            for a in items:
+                proj_counter[a.get("project_id")] = proj_counter.get(a.get("project_id"), 0) + 1
+            proj_opts = {"全部项目": None}
+            for label, pid in project_options.items():
+                if pid is None:
+                    proj_opts[f"未关联项目（{proj_counter.get(None, 0)}）"] = "__NULL__"
+                else:
+                    proj_opts[f"{label}（{proj_counter.get(pid, 0)}）"] = pid
+            if st.session_state.get("ach_filter_proj") not in proj_opts:
+                st.session_state["ach_filter_proj"] = "全部项目"
+            with c3:
+                f_proj = st.selectbox("所属项目", list(proj_opts.keys()), key="ach_filter_proj")
+
+            # —— 日期区间：标签与可用性由类型决定 ——
+            apply_label, achieve_label = _ach_date_labels(f_cats)
+            if apply_label:
+                d1, d2, d3, d4 = st.columns(4)
+                with d1:
+                    apply_from = st.text_input(f"{apply_label}（起）", placeholder="如 2026-01-01", key="ach_filter_apply_from")
+                with d2:
+                    apply_to = st.text_input(f"{apply_label}（止）", placeholder="如 2026-12-31", key="ach_filter_apply_to")
+            else:
+                apply_from = apply_to = ""  # 该类型无受理/申请维度，隐藏条件不参与判定
+            if apply_label:
+                with d3:
+                    ach_from = st.text_input(f"{achieve_label}（起）", placeholder="如 2026-01-01", key="ach_filter_ach_from")
+                with d4:
+                    ach_to = st.text_input(f"{achieve_label}（止）", placeholder="如 2026-12-31", key="ach_filter_ach_to")
+            else:
+                d3, d4 = st.columns(2)
+                with d3:
+                    ach_from = st.text_input(f"{achieve_label}（起）", placeholder="如 2026-01-01", key="ach_filter_ach_from")
+                with d4:
+                    ach_to = st.text_input(f"{achieve_label}（止）", placeholder="如 2026-12-31", key="ach_filter_ach_to")
+
+            e1, e2, e3, e4 = st.columns([1.2, 1.2, 1, 1])
+            with e1:
+                if apply_label:
+                    date_logic = st.radio(
+                        "两个日期区间", ["同时满足", "满足其一即可"], horizontal=True,
+                        key="ach_filter_date_logic",
+                        help="「同时满足」＝受理日与取得日都落在各自区间内；「满足其一即可」＝任一命中即保留。")
+                else:
+                    date_logic = "同时满足"
+            with e2:
+                include_empty = st.checkbox(
+                    "纳入日期为空的记录", value=False, key="ach_filter_include_empty",
+                    help="默认：一旦使用日期区间，日期为空的记录会被排除，保证区间筛选精确；勾选后可一并排查待补录数据。")
+            with e3:
+                quick = st.selectbox(
+                    "实质状态", ACH_QUICK_OPTIONS, key="ach_filter_quick",
+                    help="按证书实际内容判定，规避自动识别把「已下证专利」标成「已登记」的误差。")
+            with e4:
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                if st.button("🔄 重置全部条件", key="ach_filter_reset", use_container_width=True):
+                    for k in ("ach_filter_kw", "ach_filter_apply_from", "ach_filter_apply_to",
+                              "ach_filter_ach_from", "ach_filter_ach_to", "ach_filter_cats",
+                              "ach_filter_statuses", "ach_filter_proj", "ach_filter_date_logic",
+                              "ach_filter_include_empty", "ach_filter_quick"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+        # —— 执行筛选（纯函数，条件判定集中在一处，便于核对）——
+        filtered = filter_achievements(
+            items,
+            kw=kw,
+            cats=f_cats,
+            statuses=f_statuses,
+            project_id_sentinel=proj_opts[f_proj],
+            apply_from=apply_from, apply_to=apply_to,
+            ach_from=ach_from, ach_to=ach_to,
+            include_empty_date=include_empty,
+            date_logic="any" if date_logic == "满足其一即可" else "all",
+            quick=quick,
+        )
+
+        # —— 生效条件回显：让用户看得见「系统到底按什么条件判定的」——
+        cond_parts = []
+        if (kw or "").strip():
+            cond_parts.append(f"关键词「{kw.strip()}」（名称/权利人/备注/文件/项目，多词需全部命中）")
+        if f_cats:
+            cond_parts.append(f"类型 ∈ {{{ '、'.join(f_cats) }}}")
+        if f_statuses:
+            cond_parts.append(f"状态 ∈ {{{ '、'.join(f_statuses) }}}")
+        if proj_opts[f_proj] == "__NULL__":
+            cond_parts.append("所属项目 = 未关联项目")
+        elif proj_opts[f_proj] is not None:
+            cond_parts.append(f"所属项目 = {f_proj.rsplit('（', 1)[0]}")
+        if apply_label and (apply_from or apply_to):
+            cond_parts.append(f"{apply_label} ∈ [{apply_from or '不限'} ~ {apply_to or '不限'}]")
+        if ach_from or ach_to:
+            cond_parts.append(f"{achieve_label} ∈ [{ach_from or '不限'} ~ {ach_to or '不限'}]")
+        if apply_label and (apply_from or apply_to) and (ach_from or ach_to):
+            cond_parts.append(f"两组日期：{date_logic}")
+        if (apply_from or apply_to or ach_from or ach_to):
+            cond_parts.append("日期为空的记录" + ("纳入" if include_empty else "排除"))
+        if quick != "不限":
+            cond_parts.append(f"实质状态：{quick}")
+        st.caption("当前生效条件：" + ("；".join(cond_parts) if cond_parts else "无（显示全部成果）"))
+
+        # 排序（日期列随类型变化，选项随之变化，先剔除已失效的旧选项）
+        sort_opts = ["登记时间（新→旧）", f"{achieve_label}（新→旧）", f"{achieve_label}（旧→新）",
+                     "受理/申请日（新→旧）", "成果名称"]
+        if st.session_state.get("ach_sort_opt") not in sort_opts:
+            st.session_state["ach_sort_opt"] = sort_opts[0]
+        sort_opt = st.selectbox("排序", sort_opts, key="ach_sort_opt", label_visibility="collapsed")
+
+        def _sort_key(a):
+            if sort_opt.startswith(achieve_label):
+                return (_norm_date(a.get("achieve_date")), a["id"])
+            if sort_opt.startswith("受理"):
+                return (_norm_date(a.get("application_date")), a["id"])
+            if sort_opt == "成果名称":
+                return (a.get("name") or "", a["id"])
+            return (a.get("created_at") or "", a["id"])
+
+        filtered = sorted(filtered, key=_sort_key,
+                          reverse=(not sort_opt.endswith("（旧→新）") and sort_opt != "成果名称"))
+
+        # 表格日期列名随类型变化：专利显示「受理/申请日 / 授权日」，论文显示「发表日期」…
+        col_apply = apply_label or "受理 / 申请日"
+        col_achieve = achieve_label if f_cats else "取得日期"
         rows = []
         for a in filtered:
-            rows.append({
+            row = {
                 "ID": a["id"],
                 "项目": a.get("project_name") or "平台级",
                 "成果名称": a["name"] or "（待识别…）",
                 "类型": a.get("category") or "",
                 "状态": a.get("status") or "",
                 "权利人/作者": a.get("holder") or "",
-                "申请日期": a.get("application_date") or "",
-                "取得日期": a.get("achieve_date") or "",
-                "来源": src_map.get(a.get("source"), a.get("source") or "手动"),
-                "识别状态": proc_map.get(a.get("processing_status"), a.get("processing_status") or "已完成"),
-                "关联文件": a.get("file_name") or "",
-            })
+            }
+            if apply_label:  # 该类型没有受理/申请维度时不显示空列
+                row[col_apply] = a.get("application_date") or ""
+            row[col_achieve] = a.get("achieve_date") or ""
+            row["来源"] = src_map.get(a.get("source"), a.get("source") or "手动")
+            row["识别状态"] = proc_map.get(a.get("processing_status"), a.get("processing_status") or "已完成")
+            row["关联文件"] = a.get("file_name") or ""
+            rows.append(row)
         df = pd.DataFrame(rows)
 
         # 筛选结果计数 + 下载 Excel + 下载附件按钮（同一行）
@@ -3317,11 +3192,14 @@ elif menu == "🏆 成果台账":
 
 # ============ 页面5：全文搜索 ============
 
+elif menu == "🛰️ 网络通讯台账":
+    render_net_page()
+
 elif menu == "🔍 全文搜索":
     st.header("全文搜索")
 
     with st.form("search_form"):
-        keyword = st.text_input("搜索关键词", placeholder="例如：疲劳寿命、实验方法……")
+        keyword = st.text_input("搜索关键词", placeholder="例如：疲劳寿命、实验方法……", key="auto_w_3611")
         submitted = st.form_submit_button("🔍 搜索")
 
     if submitted:
@@ -3419,7 +3297,7 @@ elif menu == "🔐 审计日志":
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        limit = st.selectbox("显示条数", [100, 200, 500, 1000], index=1)
+        limit = st.selectbox("显示条数", [100, 200, 500, 1000], index=1, key="auto_w_3709")
     with c2:
         if st.button("🔄 刷新日志", use_container_width=True):
             st.rerun()
@@ -3577,6 +3455,8 @@ elif menu == "📊 数据大屏":
         c4.metric("成果数", d.get("achievement_count", 0))
         c5.metric("经费记录", d.get("funding_count", 0))
         c6.metric("合同总金额", f"¥{d.get('contract_total_amount', 0):,.0f}")
+        st.caption(f"项目状态：进行中 {d.get('active_project_count', d.get('project_count', 0))} 个 ｜ "
+                   f"已完结 {d.get('completed_project_count', 0)} 个（已完结项目不计入超期风险）")
 
         st.divider()
 
@@ -3683,3 +3563,15 @@ elif menu == "📊 数据大屏":
                     st.markdown("**按合作方执行额**")
                     st.bar_chart(fbudget["by_party"])
 
+
+
+# ============ 跨模块状态保留：运行末尾快照当前输入 ============
+# 说明见文件中部「快照-回填桥」：把白名单控件的当前值存入普通 key _keep_snap，
+# 供下一次运行（无论切到哪个模块）开头回填，实现切换模块不丢输入。
+# 注：st.rerun()/st.stop() 中断的运行不会执行到此处，但其后的正常运行会补齐快照。
+try:
+    st.session_state["_keep_snap"] = {
+        _k: st.session_state[_k] for _k in _KEEP_STATE_KEYS if _k in st.session_state
+    }
+except Exception:
+    pass
